@@ -1,0 +1,160 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Redshift Serverless namespace and workgroup - deployed in the VPC created by
+  the main cgs-ai-analyst-agent-project stack. Scales automatically based on usage.
+  Admin credentials stored in AWS Secrets Manager.
+
+Parameters:
+
+  MainStackName:
+    Type: String
+    Default: cgs-ai-analyst-agent-project
+    Description: Name of the main stack (to import VPC/subnet exports)
+
+  DatabaseName:
+    Type: String
+    Default: analytics
+    Description: Initial database name
+
+  BaseCapacity:
+    Type: Number
+    Default: 8
+    MinValue: 8
+    MaxValue: 512
+    Description: >
+      Base capacity in RPUs (Redshift Processing Units).
+      Minimum 8 RPUs. Scales up automatically under load.
+
+  Environment:
+    Type: String
+    Default: production
+    AllowedValues: [production, staging, development]
+    Description: Environment tag
+
+Resources:
+
+  # ── Credentials (auto-generated, stored in Secrets Manager) ────────────
+  RedshiftSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub "${AWS::StackName}/redshift-credentials"
+      Description: Auto-generated admin credentials for Redshift Serverless
+      GenerateSecretString:
+        SecretStringTemplate: '{"username": "admin"}'
+        GenerateStringKey: password
+        PasswordLength: 32
+        ExcludeCharacters: '"@/\'''
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ── Security Group ─────────────────────────────────────────────────────
+  RedshiftSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Redshift Serverless - allow from ECS tasks only
+      VpcId:
+        Fn::ImportValue: !Sub "${MainStackName}-VpcId"
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 5439
+          ToPort: 5439
+          SourceSecurityGroupId:
+            Fn::ImportValue: !Sub "${MainStackName}-ServiceSecurityGroup"
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-redshift-sg"
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ── Redshift Serverless Namespace ──────────────────────────────────────
+  RedshiftNamespace:
+    Type: AWS::RedshiftServerless::Namespace
+    Properties:
+      NamespaceName: !Sub "${AWS::StackName}-ns"
+      DbName: !Ref DatabaseName
+      AdminUsername: !Sub "{{resolve:secretsmanager:${RedshiftSecret}:SecretString:username}}"
+      AdminUserPassword: !Sub "{{resolve:secretsmanager:${RedshiftSecret}:SecretString:password}}"
+      DefaultIamRoleArn: !GetAtt RedshiftRole.Arn
+      IamRoles:
+        - !GetAtt RedshiftRole.Arn
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ── Redshift Serverless Workgroup ──────────────────────────────────────
+  RedshiftWorkgroup:
+    Type: AWS::RedshiftServerless::Workgroup
+    Properties:
+      WorkgroupName: !Sub "${AWS::StackName}-wg"
+      NamespaceName: !GetAtt RedshiftNamespace.Namespace.NamespaceName
+      BaseCapacity: !Ref BaseCapacity
+      PubliclyAccessible: false
+      SubnetIds:
+        - Fn::ImportValue: !Sub "${MainStackName}-PrivateSubnet1"
+        - Fn::ImportValue: !Sub "${MainStackName}-PrivateSubnet2"
+      SecurityGroupIds:
+        - !Ref RedshiftSecurityGroup
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ── IAM Role for Redshift (S3 read access) ─────────────────────────────
+  RedshiftRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${AWS::StackName}-redshift-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: redshift.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: S3ReadAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource: "*"
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+Outputs:
+
+  RedshiftWorkgroupEndpoint:
+    Description: Redshift Serverless endpoint
+    Value: !GetAtt RedshiftWorkgroup.Workgroup.Endpoint.Address
+
+  RedshiftPort:
+    Description: Redshift port
+    Value: "5439"
+
+  RedshiftDatabase:
+    Description: Default database name
+    Value: !Ref DatabaseName
+
+  RedshiftSecretArn:
+    Description: Secrets Manager ARN for credentials
+    Value: !Ref RedshiftSecret
+
+  ConnectionConfig:
+    Description: Paste into config/connections/redshift.yaml
+    Value: !Sub
+      - |
+        name: Redshift Serverless
+        type: redshift
+        enabled: true
+        settings:
+          host: ${EndpointAddress}
+          port: 5439
+          database: ${DatabaseName}
+          schema: public
+          user_from_secret: ${AWS::StackName}/redshift-credentials
+          region: ${AWS::Region}
+      - EndpointAddress: !GetAtt RedshiftWorkgroup.Workgroup.Endpoint.Address
