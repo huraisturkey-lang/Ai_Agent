@@ -12,8 +12,8 @@ COPY src /app/src
 COPY scripts /app/scripts
 COPY config /app/config
 COPY .streamlit /app/.streamlit
-COPY data /app/data
 COPY assets /app/assets
+RUN chown -R app:app /app/config
 USER app
 EXPOSE 8080 8501
 HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=3 \
