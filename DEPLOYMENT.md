@@ -249,14 +249,34 @@ Add custom tags in the script or via AWS CLI:
 
 ## Cleanup
 
-To delete the stack and all resources:
+To tear down all infrastructure at once:
+
+```bash
+make teardown
+# or: ./scripts/teardown.sh --force  (skip confirmation)
+```
+
+This deletes everything in sequence:
+1. Scales ECS services to 0
+2. Deletes RDS Aurora stack (takes a final snapshot)
+3. Deletes Redshift Serverless stack
+4. Deletes the main stack (VPC, ECS, ALB, Lambda, VPC endpoints)
+5. Deletes GitHub OIDC stack
+6. Deletes ECR repository and all images
+7. Empties and deletes S3 data buckets
+8. Deletes Athena workgroup
+9. Deletes all Glue crawlers and databases
+10. Deletes CloudWatch log groups
+
+Takes 10-15 minutes total (Aurora snapshot is the slowest step).
+
+To delete only the main stack:
 
 ```bash
 aws cloudformation delete-stack \
   --stack-name "$STACK_NAME" \
   --region "$AWS_REGION"
 
-# Wait for deletion
 aws cloudformation wait stack-delete-complete \
   --stack-name "$STACK_NAME" \
   --region "$AWS_REGION"
@@ -380,6 +400,118 @@ Or attach the missing actions to role `cgs-ai-analyst-agent-project-EcsTaskRole-
 ### Stack creation timeout
 - If the stack creation takes too long, check CloudFormation events for errors: `aws cloudformation describe-stack-events --stack-name "$STACK_NAME" --region "$AWS_REGION"`
 
+### Streamlit 503: secret marked for deletion
+
+If the Streamlit ECS service fails with:
+
+```text
+unable to retrieve secret ... InvalidRequestException: You can't perform this operation on the secret because it was marked for deletion.
+```
+
+A previous teardown scheduled the secret for deletion (30-day retention). Restore it:
+
+```bash
+aws secretsmanager restore-secret \
+  --secret-id "cgs-ai-analyst-agent/streamlit-credentials" \
+  --region eu-north-1
+
+aws secretsmanager put-secret-value \
+  --secret-id "cgs-ai-analyst-agent/streamlit-credentials" \
+  --secret-string '{"APP_USERNAME":"admin","APP_PASSWORD":"your-password"}' \
+  --region eu-north-1
+
+aws ecs update-service --cluster data-architecture-ai \
+  --service data-architecture-ai-streamlit \
+  --force-new-deployment --region eu-north-1
+```
+
+The secret JSON keys must be `APP_USERNAME` and `APP_PASSWORD` (matching the ECS task definition's secret references).
+
+### Streamlit 503: secret JSON key mismatch
+
+If the service fails with:
+
+```text
+retrieved secret from Secrets Manager did not contain json key APP_USERNAME
+```
+
+The secret exists but uses wrong keys (e.g., `username` instead of `APP_USERNAME`). Fix:
+
+```bash
+aws secretsmanager put-secret-value \
+  --secret-id "cgs-ai-analyst-agent/streamlit-credentials" \
+  --secret-string '{"APP_USERNAME":"admin","APP_PASSWORD":"your-password"}' \
+  --region eu-north-1
+```
+
+Then force redeploy the Streamlit service.
+
+### Data source not configured (empty Glue tables)
+
+After a fresh deploy, Athena queries fail because Glue databases have no tables. You need to:
+
+1. Upload sample data to S3:
+   ```bash
+   BUCKET="langchain-$(aws sts get-caller-identity --query Account --output text)-eu-north-1"
+   aws s3 cp POC/data/s3_library_data.json "s3://${BUCKET}/library/" --region eu-north-1
+   aws s3 cp POC/data/s3_cars_data_normalized.csv "s3://${BUCKET}/cars/" --region eu-north-1
+   ```
+
+2. The Lambda trigger should auto-start crawlers. If not, start them manually:
+   ```bash
+   aws glue start-crawler --name project-library-crawler --region eu-north-1
+   aws glue start-crawler --name project-cars-crawler --region eu-north-1
+   ```
+
+3. Wait 1-2 minutes, then verify tables exist:
+   ```bash
+   aws glue get-tables --database-name project_library_db --region eu-north-1 --query 'TableList[*].Name'
+   aws glue get-tables --database-name project_cars_db --region eu-north-1 --query 'TableList[*].Name'
+   ```
+
+### Glue crawler fails: AccessDenied on sts:AssumeRole
+
+After redeployment, crawlers may reference an old IAM role ARN from a previous stack. Fix by updating the crawler role:
+
+```bash
+ROLE_NAME=$(aws iam list-roles --query 'Roles[?contains(RoleName, `LibraryCrawler`)].RoleName' --output text)
+ROLE_ARN="arn:aws:iam::$(aws sts get-caller-identity --query Account --output text):role/${ROLE_NAME}"
+
+aws glue update-crawler --name project-library-crawler --role "$ROLE_ARN" --region eu-north-1
+aws glue update-crawler --name project-cars-crawler --role "$ROLE_ARN" --region eu-north-1
+```
+
+Then re-run the crawlers.
+
+### Glue crawler succeeds but creates no tables
+
+The crawler's S3 target path doesn't match where data was uploaded. Check and fix:
+
+```bash
+# Check current target
+aws glue get-crawler --name project-library-crawler --region eu-north-1 \
+  --query 'Crawler.Targets.S3Targets[0].Path'
+
+# Update if wrong (e.g., targets library-data/ but data is in library/)
+aws glue update-crawler --name project-library-crawler \
+  --targets '{"S3Targets":[{"Path":"s3://YOUR-BUCKET/library/"}]}' \
+  --region eu-north-1
+```
+
+### Permission denied writing config in container
+
+If the Streamlit UI shows:
+
+```text
+[Errno 13] Permission denied: '/app/config/connections/rds-mysql.yaml'
+```
+
+The Docker image needs rebuilding. The Dockerfile now includes `RUN chown -R app:app /app/config` to make the config directory writable at runtime. Trigger a rebuild:
+
+```bash
+gh workflow run build-and-push-image
+```
+
 ## Streamlit UI (chat)
 
 Browser interface for asking questions (local AWS or remote ECS API).
@@ -441,6 +573,25 @@ The stack provisions an **ECS Fargate** service behind an **Application Load Bal
 ```
 
 This single command: validates template → deploys stack → waits for completion → builds Docker image → pushes to ECR → starts ECS service → prints the API URL.
+
+### Post-Deploy: Load Sample Data
+
+After a fresh deploy, the Glue databases are empty. Upload sample data to populate Athena tables:
+
+```bash
+BUCKET="langchain-$(aws sts get-caller-identity --query Account --output text)-eu-north-1"
+aws s3 cp POC/data/s3_library_data.json "s3://${BUCKET}/library/" --region eu-north-1
+aws s3 cp POC/data/s3_cars_data_normalized.csv "s3://${BUCKET}/cars/" --region eu-north-1
+```
+
+The S3 upload triggers a Lambda which auto-creates Glue crawlers and databases. Wait 1-2 minutes for crawlers to finish, then the app can query data.
+
+If crawlers don't auto-start (check `aws glue get-crawler --name project-library-crawler --query 'Crawler.State'`), start manually:
+
+```bash
+aws glue start-crawler --name project-library-crawler --region eu-north-1
+aws glue start-crawler --name project-cars-crawler --region eu-north-1
+```
 
 #### Manual (step by step)
 
