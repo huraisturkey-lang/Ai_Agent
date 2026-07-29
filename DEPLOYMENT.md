@@ -7,21 +7,30 @@ This guide shows how to deploy the `cloudformation-template-validated.yml` templ
 After making code changes, use these commands to update the running stack:
 
 ```bash
-# Rebuild image + redeploy both ECS services (most common)
+# Build image via GitHub Actions (no Docker Desktop needed) — recommended
+gh workflow run build-and-push-image
+
+# Or rebuild image locally + redeploy both ECS services (requires Docker Desktop)
 ./scripts/push_ecr.sh
 
-# Redeploy only the Streamlit UI service
+# Redeploy only the Streamlit UI service (no rebuild, uses existing image)
 aws ecs update-service --cluster data-architecture-ai \
   --service data-architecture-ai-streamlit \
   --force-new-deployment --region eu-north-1
 
-# Redeploy only the FastAPI service
+# Redeploy only the FastAPI service (no rebuild, uses existing image)
 aws ecs update-service --cluster data-architecture-ai \
   --service data-architecture-ai \
   --force-new-deployment --region eu-north-1
 
-# Full deploy (CloudFormation + image + restart everything)
+# Full deploy (CloudFormation + image + CI/CD setup)
 ./deploy-changeset.sh --auto
+
+# Full deploy + RDS Aurora + Redshift Serverless
+./deploy-changeset.sh --auto --with-databases
+
+# Tear down everything (all stacks, buckets, databases)
+make teardown
 
 # Or via make
 make deploy-all
@@ -34,13 +43,24 @@ make deploy-all
 | `data-architecture-ai` | 8080 | `scripts/serve.py` | FastAPI REST API (`/health`, `/query`) |
 | `data-architecture-ai-streamlit` | 8501 | `streamlit run scripts/streamlit_app.py` | Browser chat UI |
 
-Both use the same Docker image with different entrypoints. The Streamlit UI calls AWS directly via VPC endpoints (local mode). The API service is available externally for programmatic access.
+Both use the same Docker image with different entrypoints. The Streamlit UI calls AWS directly via VPC endpoints (local mode) and requires `APP_USERNAME`/`APP_PASSWORD` for authentication. The API service is available externally for programmatic access (optionally secured with `API_KEY`).
+
+### CloudFormation Stacks
+
+| Stack | Template | Deployed by |
+|-------|----------|-------------|
+| `cgs-ai-analyst-agent-project` | `cloudformation-template-validated.yml` | `--auto` (always) |
+| `github-actions-oidc` | `cloudformation-github-oidc.yml` | `--auto` (always) |
+| `cgs-ai-rds-aurora` | `cloudformation-rds-aurora.yml` | `--with-databases` |
+| `cgs-ai-redshift-serverless` | `cloudformation-redshift-serverless.yml` | `--with-databases` |
 
 ### Architecture
 
 ```
-Internet → ALB:80  → FastAPI (ECS private subnet) → Bedrock/Athena via VPC endpoints
+Internet → ALB:80   → FastAPI (ECS private subnet) → Bedrock/Athena via VPC endpoints
 Internet → ALB:8501 → Streamlit (ECS private subnet) → Bedrock/Athena via VPC endpoints
+                                                     → RDS Aurora (private subnet, port 3306)
+                                                     → Redshift Serverless (private subnet, port 5439)
 ```
 
 ---
@@ -54,16 +74,17 @@ Internet → ALB:8501 → Streamlit (ECS private subnet) → Bedrock/Athena via 
 
 ### Docker Desktop Requirements
 
-Docker Desktop is **only needed** when building and pushing container images to ECR:
+Docker Desktop is **only needed** when building and pushing container images locally. For most workflows, use GitHub Actions instead:
 
 | Task | Docker Desktop Required? |
 |------|:------------------------:|
+| Build image via GitHub Actions (`gh workflow run build-and-push-image`) | No |
+| Push to main (auto-deploys via `deploy.yml`) | No |
+| Building images locally (`./scripts/push_ecr.sh`) | Yes |
+| Full auto deploy locally (`./deploy-changeset.sh --auto`) | Yes |
+| `make deploy-all` | Yes |
 
-| Building and pushing container images (`./scripts/push_ecr.sh`) | ✅ Yes |
-| Full auto deploy (`./deploy-changeset.sh --auto`) | ✅ Yes |
-| `make deploy-all` | ✅ Yes |
-
-**In short:** Once the image is in ECR and the ECS service is running, Docker Desktop can be closed. You only need it when rebuilding the container.
+**Recommended:** Use `gh workflow run build-and-push-image` to build and deploy without Docker Desktop.
 
 > **No VPC required beforehand.** The stack creates its own VPC (10.0.0.0/16), public subnets
 > (ALB), private subnets (ECS tasks), and all VPC endpoints. No NAT gateway is used — AWS
@@ -367,21 +388,29 @@ Browser interface for asking questions (local AWS or remote ECS API).
 
 ```bash
 export GLUE_DB_NAME=project_library_db
+export GLUE_DB_NAMES=project_library_db,project_cars_db
 export PROJECT_FILES_BUCKET=langchain-015337708931-eu-north-1
 export ATHENA_WORKGROUP=project-text-to-sql
 export ATHENA_USE_MANAGED_RESULTS=true
-pip install -r requirements-dev.txt   # streamlit is in dev deps
+export APP_USERNAME=your-username
+export APP_PASSWORD=your-password
+pip install -r requirements-dev.txt   # hypothesis is in dev deps
 make ui
 # or: PYTHONPATH=src streamlit run scripts/streamlit_app.py
 ```
 
 Opens at **http://localhost:8501**
 
+> **Authentication:** The Streamlit UI requires `APP_USERNAME` and `APP_PASSWORD` environment variables.
+> Without these, the login screen blocks access.
+
 ### Remote mode (calls ECS API behind the load balancer)
 
 ```bash
 export API_URL=http://<your-alb-dns>
 export API_KEY=your-key   # only if you set ApiKey in CloudFormation
+export APP_USERNAME=your-username
+export APP_PASSWORD=your-password
 streamlit run scripts/streamlit_app.py
 ```
 
@@ -477,6 +506,10 @@ curl -X POST "${ALB_URL}/query" \
 | `CreateAppLogGroup` | `true` | Set `false` if the CloudWatch log group `/ecs/data-architecture-ai` already exists |
 | `GlueDatabaseForQueries` | `project_library_db` | Primary Glue DB for Athena connection |
 
+> **Multi-database querying:** At runtime, the app reads `GLUE_DB_NAMES` (comma-separated) from the
+> ECS task environment. This allows querying across multiple Glue databases (e.g., library + cars).
+> Falls back to `GLUE_DB_NAME` (single value) if `GLUE_DB_NAMES` is not set.
+
 > **No VpcId or PublicSubnetIds parameters.** The stack creates and owns the entire network.
 > ECS tasks run in private subnets with `AssignPublicIp: DISABLED`. All AWS API calls
 > (ECR, Bedrock, Athena, Glue, Secrets Manager, CloudWatch Logs) use VPC interface endpoints.
@@ -486,12 +519,16 @@ curl -X POST "${ALB_URL}/query" \
 
 ```bash
 export GLUE_DB_NAME=project_library_db
+export GLUE_DB_NAMES=project_library_db,project_cars_db
 export PROJECT_FILES_BUCKET=langchain-<account-id>-eu-north-1
 export ATHENA_WORKGROUP=project-text-to-sql
 export ATHENA_USE_MANAGED_RESULTS=true
 PYTHONPATH=src python scripts/serve.py
 # curl http://localhost:8080/health
 ```
+
+> **Multi-database support:** Set `GLUE_DB_NAMES` (comma-separated) to query across multiple Glue databases.
+> Falls back to `GLUE_DB_NAME` if `GLUE_DB_NAMES` is not set.
 
 ### CLI mode (Docker)
 
@@ -511,17 +548,43 @@ docker run --rm \
 - [Change Sets Documentation](https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/using-cfn-updating-stacks-changesets.html)
 - [IAM Best Practices](https://docs.aws.amazon.com/IAM/latest/UserGuide/best-practices.html)
 
+## Environment Variables Reference
+
+All runtime configuration is loaded via pydantic `BaseSettings` from environment variables (or `.env` file).
+
+| Variable | Default | Required | Description |
+|----------|---------|----------|-------------|
+| `GLUE_DB_NAME` | - | Yes* | Primary Glue database name |
+| `GLUE_DB_NAMES` | - | No | Comma-separated Glue databases (overrides `GLUE_DB_NAME`) |
+| `PROJECT_FILES_BUCKET` | - | Yes | S3 bucket for data and Athena results |
+| `AWS_REGION` | `eu-north-1` | No | AWS region |
+| `ATHENA_WORKGROUP` | `primary` | No | Athena workgroup name |
+| `ATHENA_USE_MANAGED_RESULTS` | - | No | Set `true` if workgroup uses managed results |
+| `BEDROCK_MODEL` | `eu.amazon.nova-micro-v1:0` | No | Bedrock model ID or inference profile |
+| `BEDROCK_MAX_RETRIES` | `4` | No | Max retry attempts for Bedrock calls |
+| `BEDROCK_RETRY_BASE_DELAY` | `1.0` | No | Base delay (seconds) between retries |
+| `MAX_RESULT_ROWS` | `200` | No | Maximum rows returned per query |
+| `MAX_QUESTION_CHARS` | `1000` | No | Maximum question length |
+| `LOG_LEVEL` | `INFO` | No | Logging level (DEBUG/INFO/WARNING/ERROR/CRITICAL) |
+| `PORT` | `8080` | No | HTTP API listen port |
+| `API_KEY` | - | No | Optional `X-Api-Key` header for API auth |
+| `API_URL` | - | No | ECS API URL (for remote-mode Streamlit) |
+| `APP_USERNAME` | - | Yes** | Streamlit UI login username |
+| `APP_PASSWORD` | - | Yes** | Streamlit UI login password |
+| `SECRETS_MANAGER_SECRET` | - | No | Secrets Manager secret name |
+
+\* At least one of `GLUE_DB_NAME` or `GLUE_DB_NAMES` must be set.
+\** Required for the Streamlit UI. Not needed for the FastAPI service.
+
 ## CI/CD — Automated Docker Build & Deploy to Fargate
 
-The `.github/workflows/deploy.yml` workflow automates the full build-push-deploy cycle.
+Two GitHub Actions workflows handle CI/CD:
 
-### Trigger
+### 1. `deploy.yml` — Full Pipeline (automatic)
 
-- **Automatic:** every push to `main` (after tests pass)
-- **Manual:** click "Run workflow" in GitHub Actions (optionally set `desired_count`)
+**Trigger:** every push to `main` (after tests pass), or manual dispatch
 
-### What it does
-
+**What it does:**
 1. Runs compile check + unit tests + smoke test (gate)
 2. Builds `linux/amd64` Docker image
 3. Pushes to ECR with both `:latest` and `:<commit-sha>` tags
@@ -529,16 +592,44 @@ The `.github/workflows/deploy.yml` workflow automates the full build-push-deploy
 5. Waits for service stability
 6. Prints the ALB URL
 
+### 2. `build-image.yml` — Build & Deploy Only (manual)
+
+**Trigger:** manual dispatch only (`gh workflow run build-and-push-image`)
+
+**What it does:**
+1. Builds `linux/amd64` Docker image (skips tests)
+2. Pushes to ECR with both `:latest` and `:<commit-sha>` tags
+3. Forces ECS service redeployment
+4. Waits for service stability
+5. Prints the ALB URL
+
+**Use this when:**
+- Docker Desktop is unavailable locally
+- You need to rebuild the image without waiting for tests
+- You want to deploy a specific commit quickly
+
+**Trigger from CLI:**
+```bash
+gh workflow run build-and-push-image --field desired_count=1 --field streamlit_desired_count=1
+```
+
 ### Setup required
 
-1. Create an IAM role for GitHub Actions with permissions for ECR, ECS, and CloudFormation read:
+1. Deploy the OIDC stack (done automatically by `./deploy-changeset.sh --auto`):
+   ```bash
+   aws cloudformation deploy \
+     --template-file cloudformation-github-oidc.yml \
+     --stack-name github-actions-oidc \
+     --capabilities CAPABILITY_NAMED_IAM \
+     --region eu-north-1
    ```
-   ecr:GetAuthorizationToken, ecr:BatchCheckLayerAvailability, ecr:PutImage, ...
-   ecs:UpdateService, ecs:DescribeServices
-   cloudformation:DescribeStacks
+2. Set the GitHub secret:
+   ```bash
+   ROLE_ARN=$(aws cloudformation describe-stacks --stack-name github-actions-oidc --region eu-north-1 \
+     --query "Stacks[0].Outputs[?OutputKey=='DeployRoleArn'].OutputValue" --output text)
+   gh secret set AWS_DEPLOY_ROLE_ARN --body "$ROLE_ARN"
    ```
-2. Store the role ARN as a GitHub secret: `AWS_DEPLOY_ROLE_ARN`
-3. Enable OIDC trust between GitHub and your AWS account ([docs](https://docs.github.com/en/actions/deployment/security-hardening-your-deployments/configuring-openid-connect-in-amazon-web-services))
+3. The OIDC role grants: ECR push, ECS update, CloudFormation read (scoped to this project)
 
 ## Lambda — Auto-Trigger Glue Crawlers on S3 Upload
 
@@ -673,3 +764,99 @@ aws cloudformation delete-stack \
 ```
 
 A final snapshot is created automatically before deletion.
+
+## Redshift Serverless
+
+A separate CloudFormation stack deploys Redshift Serverless in the same VPC for analytics workloads.
+
+### Deploy
+
+```bash
+aws cloudformation deploy \
+  --template-file cloudformation-redshift-serverless.yml \
+  --stack-name cgs-ai-redshift-serverless \
+  --capabilities CAPABILITY_NAMED_IAM \
+  --region eu-north-1 \
+  --no-fail-on-empty-changeset
+```
+
+Or use the full deploy script which includes Redshift:
+
+```bash
+./deploy-changeset.sh --auto --with-databases
+```
+
+### Connect the app
+
+Paste into `config/connections/redshift.yaml`:
+
+```yaml
+name: Redshift Serverless
+type: redshift
+enabled: true
+settings:
+  host: cgs-ai-redshift-serverless-wg.015337708931.eu-north-1.redshift-serverless.amazonaws.com
+  port: 5439
+  database: analytics
+  schema: public
+  user_from_secret: cgs-ai-redshift-serverless/redshift-credentials
+  region: eu-north-1
+```
+
+### Architecture
+
+- **Template:** `cloudformation-redshift-serverless.yml`
+- **Stack name:** `cgs-ai-redshift-serverless`
+- **Engine:** Redshift Serverless
+- **Base capacity:** 8 RPU (configurable)
+- **Network:** Same VPC + private subnets as the main stack
+- **Security:** Only ECS tasks can connect (port 5439 restricted to `ServiceSecurityGroup`)
+- **Credentials:** Auto-generated, stored in Secrets Manager
+
+### Delete
+
+```bash
+aws cloudformation delete-stack \
+  --stack-name cgs-ai-redshift-serverless \
+  --region eu-north-1
+```
+
+## Production Readiness Checklist
+
+The following items are recommended before serving real production traffic:
+
+### Security (critical)
+- [ ] Enable HTTPS — add ACM certificate, configure HTTPS listener on ALB (set `CertificateArn` parameter)
+- [ ] Enforce API authentication — set the `API_KEY` environment variable in ECS task definition
+- [ ] Add AWS WAF — attach WAF WebACL to the ALB for DDoS protection and rate limiting
+- [ ] Restrict ALB ingress — change `AlbIngressCidr` from `0.0.0.0/0` to known IP ranges or use CloudFront
+- [ ] Add a custom domain — Route 53 alias record pointing to ALB, with HTTPS
+
+### Observability (high priority)
+- [ ] Structured JSON logging — use `python-json-logger` for CloudWatch Insights queries
+- [ ] Request tracing — enable AWS X-Ray on ECS tasks for end-to-end trace visibility
+- [ ] CloudWatch alarms — 5xx error rate, ECS task health, Bedrock throttle count, Athena query failures
+- [ ] Operational dashboard — CloudWatch dashboard with key metrics
+
+### Reliability
+- [ ] Auto-scaling — add ECS Service Auto Scaling policy (target CPU/memory or request count)
+- [ ] Request timeouts — configure uvicorn worker timeout and Bedrock call deadline
+- [ ] Circuit breaker — add fallback when Bedrock is throttled (e.g., cached response or graceful error)
+- [ ] Multi-AZ validation — verify tasks distribute across both private subnets
+
+### Performance & Cost
+- [ ] Response caching — cache common question/answer pairs (reduces 3 LLM calls to 0)
+- [ ] Rate limiting — per-user request throttle to protect Bedrock quota
+- [ ] Right-size Bedrock model — evaluate `nova-pro` vs `nova-micro` for accuracy/cost tradeoff
+
+### Compliance & Audit
+- [ ] Query audit log — log every question, generated SQL, and response to a dedicated log group
+- [ ] PII filtering — scan query results before returning to user
+- [ ] Data access control — row-level or database-level permissions per user/role
+
+### CI/CD & Testing
+- [ ] Fix broken tests (`test_runner`, `test_sidebar_properties`) so `deploy.yml` gates work
+- [ ] Add integration tests that verify Athena queries end-to-end
+- [ ] Add load testing baseline (k6, locust, or similar)
+- [ ] Enable ECR image scanning for CVE detection
+- [ ] Add staging environment (separate stack with `Environment=staging` tag)
