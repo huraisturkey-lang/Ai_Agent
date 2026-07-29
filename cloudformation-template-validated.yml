@@ -67,7 +67,12 @@ Parameters:
   AlbIngressCidr:
     Type: String
     Default: 0.0.0.0/0
-    Description: CIDR allowed to reach the load balancer on HTTP (restrict in production)
+    Description: CIDR allowed to reach the load balancer on HTTP/HTTPS (restrict in production)
+
+  CertificateArn:
+    Type: String
+    Default: ""
+    Description: ACM certificate ARN for HTTPS. Leave empty to use HTTP only (not recommended for production).
 
   # ── Glue / Athena ─────────────────────────────────────────────────────────
   GlueDatabaseForQueries:
@@ -127,15 +132,46 @@ Parameters:
     AllowedValues: ["true", "false"]
     Description: Set false if the CloudWatch log group /ecs/data-architecture-ai already exists
 
+  CreateCrawlers:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+    Description: >
+      Set true only if S3 data prefixes already exist. Crawlers are auto-created
+      by Lambda when data is uploaded, so this is usually false on first deploy.
+
+  # ── Streamlit UI ──────────────────────────────────────────────────────────
+  StreamlitDesiredCount:
+    Type: Number
+    Default: 1
+    MinValue: 0
+    MaxValue: 10
+    Description: >
+      Fargate task count for the Streamlit UI service.
+
+  StreamlitUsername:
+    Type: String
+    NoEcho: false
+    Default: ""
+    Description: (Deprecated - now uses Secrets Manager) Login username for the Streamlit chat UI
+
+  StreamlitPassword:
+    Type: String
+    NoEcho: true
+    Default: ""
+    Description: (Deprecated - now uses Secrets Manager) Login password for the Streamlit chat UI
+
 
 Conditions:
   UseCustomImage: !Not [!Equals [!Ref ContainerImage, ""]]
   UseApiKey: !Not [!Equals [!Ref ApiKey, ""]]
+  UseHttps: !Not [!Equals [!Ref CertificateArn, ""]]
   CreatePrimaryDataBucket: !Equals [!Ref CreatePrimaryDataBucket, "true"]
   CreateAthenaWorkgroup: !Equals [!Ref CreateAthenaWorkgroup, "true"]
   CreateLibraryGlueDatabase: !Equals [!Ref CreateLibraryGlueDatabase, "true"]
   CreateCarsGlueDatabase: !Equals [!Ref CreateCarsGlueDatabase, "true"]
   CreateAppLogGroup: !Equals [!Ref CreateAppLogGroup, "true"]
+  CreateCrawlers: !Equals [!Ref CreateCrawlers, "true"]
 
 Metadata:
   CgsAiAnalystAgentProject:
@@ -514,6 +550,7 @@ Resources:
 
   LibraryCrawler:
     Type: AWS::Glue::Crawler
+    Condition: CreateCrawlers
     Properties:
       Name: project-library-crawler
       Role: !GetAtt LibraryCrawlerRole.Arn
@@ -532,6 +569,7 @@ Resources:
 
   CarsCrawler:
     Type: AWS::Glue::Crawler
+    Condition: CreateCrawlers
     Properties:
       Name: project-cars-crawler
       Role: !GetAtt LibraryCrawlerRole.Arn
@@ -611,6 +649,12 @@ Resources:
       LogGroupName: /ecs/data-architecture-ai
       RetentionInDays: 30
 
+  StreamlitLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /ecs/data-architecture-ai-streamlit
+      RetentionInDays: 30
+
   # ══════════════════════════════════════════════════════════════════════════
   # ECS Cluster
   # ══════════════════════════════════════════════════════════════════════════
@@ -642,6 +686,16 @@ Resources:
             Action: sts:AssumeRole
       ManagedPolicyArns:
         - !Sub "arn:${AWS::Partition}:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy"
+      Policies:
+        - PolicyName: SecretsManagerAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:cgs-ai-analyst-agent/*"
       Tags:
         - Key: Environment
           Value: !Ref Environment
@@ -740,6 +794,17 @@ Resources:
           FromPort: 80
           ToPort: 80
           CidrIp: !Ref AlbIngressCidr
+        - IpProtocol: tcp
+          FromPort: 8501
+          ToPort: 8501
+          CidrIp: !Ref AlbIngressCidr
+        - !If
+          - UseHttps
+          - IpProtocol: tcp
+            FromPort: 443
+            ToPort: 443
+            CidrIp: !Ref AlbIngressCidr
+          - !Ref AWS::NoValue
       Tags:
         - Key: Name
           Value: !Sub "${AWS::StackName}-alb-sg"
@@ -755,6 +820,10 @@ Resources:
         - IpProtocol: tcp
           FromPort: 8080
           ToPort: 8080
+          SourceSecurityGroupId: !Ref AlbSecurityGroup
+        - IpProtocol: tcp
+          FromPort: 8501
+          ToPort: 8501
           SourceSecurityGroupId: !Ref AlbSecurityGroup
       Tags:
         - Key: Name
@@ -802,6 +871,24 @@ Resources:
         - Key: Environment
           Value: !Ref Environment
 
+  StreamlitTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: data-arch-ai-streamlit-tg
+      Port: 8501
+      Protocol: HTTP
+      VpcId: !Ref Vpc
+      TargetType: ip
+      HealthCheckPath: /_stcore/health
+      HealthCheckIntervalSeconds: 30
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      Matcher:
+        HttpCode: 200
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
   HttpListener:
     Type: AWS::ElasticLoadBalancingV2::Listener
     Properties:
@@ -809,8 +896,39 @@ Resources:
       Port: 80
       Protocol: HTTP
       DefaultActions:
+        - !If
+          - UseHttps
+          - Type: redirect
+            RedirectConfig:
+              Protocol: HTTPS
+              Port: "443"
+              StatusCode: HTTP_301
+          - Type: forward
+            TargetGroupArn: !Ref TargetGroup
+
+  HttpsListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Condition: UseHttps
+    Properties:
+      LoadBalancerArn: !Ref ApplicationLoadBalancer
+      Port: 443
+      Protocol: HTTPS
+      SslPolicy: ELBSecurityPolicy-TLS13-1-2-2021-06
+      Certificates:
+        - CertificateArn: !Ref CertificateArn
+      DefaultActions:
         - Type: forward
           TargetGroupArn: !Ref TargetGroup
+
+  StreamlitListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref ApplicationLoadBalancer
+      Port: 8501
+      Protocol: HTTP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref StreamlitTargetGroup
 
   # ══════════════════════════════════════════════════════════════════════════
   # ECS Task Definition & Service — private subnets, no public IP
@@ -902,6 +1020,97 @@ Resources:
           Value: !Ref Environment
 
   # ══════════════════════════════════════════════════════════════════════════
+  # Streamlit ECS Task Definition — same image, different entrypoint
+  # ══════════════════════════════════════════════════════════════════════════
+
+  StreamlitTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: data-architecture-ai-streamlit
+      Cpu: "512"
+      Memory: "1024"
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      ExecutionRoleArn: !GetAtt EcsTaskExecutionRole.Arn
+      TaskRoleArn: !GetAtt EcsTaskRole.Arn
+      ContainerDefinitions:
+        - Name: streamlit
+          Image: !If
+            - UseCustomImage
+            - !Ref ContainerImage
+            - !Sub "${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/data-architecture-ai:latest"
+          Essential: true
+          Command:
+            - streamlit
+            - run
+            - /app/scripts/streamlit_app.py
+            - "--server.port=8501"
+            - "--server.address=0.0.0.0"
+          PortMappings:
+            - ContainerPort: 8501
+              Protocol: tcp
+          Environment:
+            - Name: PYTHONPATH
+              Value: /app/src
+            - Name: GLUE_DB_NAME
+              Value: !Ref GlueDatabaseForQueries
+            - Name: GLUE_DB_NAMES
+              Value: !Sub "${LibraryGlueDatabaseName},${CarsGlueDatabaseName}"
+            - Name: PROJECT_FILES_BUCKET
+              Value: !Ref PrimaryDataBucketName
+            - Name: AWS_REGION
+              Value: !Ref AWS::Region
+            - Name: ATHENA_WORKGROUP
+              Value: !Ref AthenaWorkgroupName
+            - Name: BEDROCK_MODEL
+              Value: eu.amazon.nova-micro-v1:0
+            - Name: LOG_LEVEL
+              Value: INFO
+            - !If
+              - UseApiKey
+              - Name: API_KEY
+                Value: !Ref ApiKey
+              - !Ref AWS::NoValue
+          Secrets:
+            - Name: APP_USERNAME
+              ValueFrom: !Sub "arn:${AWS::Partition}:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:cgs-ai-analyst-agent/streamlit-credentials-bTgUBr:APP_USERNAME::"
+            - Name: APP_PASSWORD
+              ValueFrom: !Sub "arn:${AWS::Partition}:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:cgs-ai-analyst-agent/streamlit-credentials-bTgUBr:APP_PASSWORD::"
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref StreamlitLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: streamlit
+
+  StreamlitService:
+    Type: AWS::ECS::Service
+    DependsOn: StreamlitListener
+    Properties:
+      ServiceName: data-architecture-ai-streamlit
+      Cluster: !Ref EcsCluster
+      TaskDefinition: !Ref StreamlitTaskDefinition
+      DesiredCount: !Ref StreamlitDesiredCount
+      LaunchType: FARGATE
+      HealthCheckGracePeriodSeconds: 120
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: DISABLED
+          Subnets:
+            - !Ref PrivateSubnet1
+            - !Ref PrivateSubnet2
+          SecurityGroups:
+            - !Ref ServiceSecurityGroup
+      LoadBalancers:
+        - ContainerName: streamlit
+          ContainerPort: 8501
+          TargetGroupArn: !Ref StreamlitTargetGroup
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ══════════════════════════════════════════════════════════════════════════
   # Lambda — S3 trigger that auto-creates Glue DBs/Crawlers for new prefixes
   # ══════════════════════════════════════════════════════════════════════════
 
@@ -951,7 +1160,7 @@ Resources:
     Properties:
       FunctionName: !Sub "${AWS::StackName}-s3-crawler-trigger"
       Runtime: python3.11
-      Handler: handler.handler
+      Handler: index.handler
       Timeout: 60
       MemorySize: 128
       Role: !GetAtt CrawlerTriggerLambdaRole.Arn
@@ -1085,10 +1294,12 @@ Outputs:
     Value: !Ref CarsGlueDatabaseName
 
   LibraryCrawlerName:
+    Condition: CreateCrawlers
     Description: Glue crawler name for the library dataset
     Value: !Ref LibraryCrawler
 
   CarsCrawlerName:
+    Condition: CreateCrawlers
     Description: Glue crawler name for the cars dataset
     Value: !Ref CarsCrawler
 
@@ -1103,6 +1314,10 @@ Outputs:
   LoadBalancerUrl:
     Description: Public HTTP URL for the Text-to-SQL API
     Value: !Sub "http://${ApplicationLoadBalancer.DNSName}"
+
+  StreamlitUrl:
+    Description: Streamlit Chat UI URL
+    Value: !Sub "http://${ApplicationLoadBalancer.DNSName}:8501"
 
   EcsClusterName:
     Description: ECS cluster running the API service

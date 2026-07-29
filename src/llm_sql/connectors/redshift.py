@@ -77,12 +77,15 @@ class RedshiftConnector(BaseConnector):
         conn = self._get_connection()
         try:
             cursor = conn.cursor()
-            cursor.execute(f"""
+            cursor.execute(
+                """
                 SELECT table_name, column_name
                 FROM information_schema.columns
-                WHERE table_schema = '{schema_name}'
+                WHERE table_schema = %s
                 ORDER BY table_name, ordinal_position
-            """)
+                """,
+                (schema_name,),
+            )
             rows = cursor.fetchall()
         finally:
             conn.close()

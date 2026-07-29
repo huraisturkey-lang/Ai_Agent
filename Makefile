@@ -20,13 +20,13 @@ PYTHON ?= python3
 VENV := .venv
 VENV_PYTHON := $(VENV)/bin/python3
 
-.PHONY: check test smoke prod-check ui deploy deploy-all setup venv
+.PHONY: check test smoke prod-check ui deploy deploy-all setup venv teardown
 
 # Create virtual environment and install dependencies
 venv:
 	@test -d $(VENV) || $(PYTHON) -m venv $(VENV)
 	$(VENV_PYTHON) -m pip install -q --upgrade pip
-	$(VENV_PYTHON) -m pip install -q -r requirements.txt
+	$(VENV_PYTHON) -m pip install -q -r requirements-dev.txt
 
 # Compile-check all Python code (catches syntax errors fast)
 check:
@@ -58,3 +58,7 @@ deploy-all:
 # Create virtualenv and install dependencies
 setup:
 	./scripts/setup.sh
+
+# Tear down all AWS infrastructure (asks for confirmation)
+teardown:
+	./scripts/teardown.sh

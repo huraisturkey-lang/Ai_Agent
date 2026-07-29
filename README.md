@@ -10,8 +10,11 @@ Quick setup
 ```bash
 python -m venv .venv
 source .venv/bin/activate
-pip install -r requirements.txt
+pip install -r requirements-dev.txt   # includes Streamlit, hypothesis, and all prod deps
 ```
+
+> **Note:** `requirements.txt` contains only production dependencies (shipped in Docker).
+> `requirements-dev.txt` pulls in `requirements.txt` plus Streamlit and hypothesis for local development.
 
 2. Configure AWS credentials (environment or AWS CLI).
 3. Run `setup.sh` to perform optional staging actions (uploads are commented out).
@@ -27,17 +30,18 @@ Docker Desktop
 - Once the image is in ECR and ECS is running, Docker Desktop can be closed.
 
 Files
-- `requirements.txt` — pinned project dependencies
+- `requirements.txt` — production dependencies (used by Docker)
+- `requirements-dev.txt` — dev/test extras (Streamlit, hypothesis) plus all of `requirements.txt`
 - `scripts/streamlit_app.py` — Streamlit chat UI (`make ui`)
 - `scripts/setup.sh` — helper script to install deps and optionally upload files
 - `scripts/normalize_cars.py` — ingestion and normalization for `s3_cars_data.csv`
 - `scripts/deploy-rds.sh` — deploy Aurora Serverless v2 (separate stack)
 - `scripts/load_rds_data.py` — load sample data (library + cars) into Aurora via Secrets Manager credentials
-- `schema/cars_schema.json`, `schema/library_schema.json` — JSON Schema draft-07 definitions
+- `POC/schema/cars_schema.json`, `POC/schema/library_schema.json` — JSON Schema draft-07 definitions (reference only)
 - `cloudformation-template-validated.yml` — main IaC template (VPC, S3, Glue, ECS, Lambda)
 - `cloudformation-rds-aurora.yml` — Aurora Serverless v2 template (separate stack)
 - `config/connections/*.yaml.template` — data source connection templates (Athena, Redshift, RDS, Snowflake, Databricks)
-- `src/llm_sql/connectors/` — multi-connector framework
+- `src/llm_sql/connectors/` — multi-connector framework (full LLM-powered querying for all connectors)
 - `.env.template` — environment variable template
 - `deploy-changeset.sh` — deployment script for main stack
 - `DEPLOYMENT.md` — detailed deployment guide with examples
@@ -139,6 +143,9 @@ export CFN_STACK_NAME=cgs-ai-analyst-agent-project
 ```
 
 Streamlit UI
+
+Streamlit is in `requirements-dev.txt`. Use `make ui` (which installs dev deps into `.venv` automatically) or install manually first:
+
 ```bash
 export GLUE_DB_NAME=project_library_db
 export PROJECT_FILES_BUCKET=langchain-<account-id>-eu-north-1

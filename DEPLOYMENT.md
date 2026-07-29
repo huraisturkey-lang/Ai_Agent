@@ -2,6 +2,49 @@
 
 This guide shows how to deploy the `cloudformation-template-validated.yml` template using AWS CloudFormation change sets.
 
+## Quick Redeployment Cheat Sheet
+
+After making code changes, use these commands to update the running stack:
+
+```bash
+# Rebuild image + redeploy both ECS services (most common)
+./scripts/push_ecr.sh
+
+# Redeploy only the Streamlit UI service
+aws ecs update-service --cluster data-architecture-ai \
+  --service data-architecture-ai-streamlit \
+  --force-new-deployment --region eu-north-1
+
+# Redeploy only the FastAPI service
+aws ecs update-service --cluster data-architecture-ai \
+  --service data-architecture-ai \
+  --force-new-deployment --region eu-north-1
+
+# Full deploy (CloudFormation + image + restart everything)
+./deploy-changeset.sh --auto
+
+# Or via make
+make deploy-all
+```
+
+### Services Overview
+
+| Service | Port | Entrypoint | Purpose |
+|---------|------|-----------|---------|
+| `data-architecture-ai` | 8080 | `scripts/serve.py` | FastAPI REST API (`/health`, `/query`) |
+| `data-architecture-ai-streamlit` | 8501 | `streamlit run scripts/streamlit_app.py` | Browser chat UI |
+
+Both use the same Docker image with different entrypoints. The Streamlit UI calls AWS directly via VPC endpoints (local mode). The API service is available externally for programmatic access.
+
+### Architecture
+
+```
+Internet → ALB:80  → FastAPI (ECS private subnet) → Bedrock/Athena via VPC endpoints
+Internet → ALB:8501 → Streamlit (ECS private subnet) → Bedrock/Athena via VPC endpoints
+```
+
+---
+
 ## Prerequisites
 
 - AWS CLI installed and configured with credentials
@@ -327,7 +370,7 @@ export GLUE_DB_NAME=project_library_db
 export PROJECT_FILES_BUCKET=langchain-015337708931-eu-north-1
 export ATHENA_WORKGROUP=project-text-to-sql
 export ATHENA_USE_MANAGED_RESULTS=true
-pip install -r requirements.txt
+pip install -r requirements-dev.txt   # streamlit is in dev deps
 make ui
 # or: PYTHONPATH=src streamlit run scripts/streamlit_app.py
 ```
@@ -430,6 +473,7 @@ curl -X POST "${ALB_URL}/query" \
 | `ContainerImage` | ECR `:latest` | Override with a specific image URI |
 | `ApiKey` | empty | Optional `X-Api-Key` header value |
 | `AlbIngressCidr` | `0.0.0.0/0` | Restrict in production |
+| `CertificateArn` | empty | ACM certificate ARN for HTTPS (recommended for production) |
 | `CreateAppLogGroup` | `true` | Set `false` if the CloudWatch log group `/ecs/data-architecture-ai` already exists |
 | `GlueDatabaseForQueries` | `project_library_db` | Primary Glue DB for Athena connection |
 

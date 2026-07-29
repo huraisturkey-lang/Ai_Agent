@@ -1,0 +1,96 @@
+name: build-and-push-image
+
+on:
+  workflow_dispatch:
+    inputs:
+      desired_count:
+        description: "ECS desired task count"
+        required: false
+        default: "1"
+      streamlit_desired_count:
+        description: "Streamlit ECS desired task count"
+        required: false
+        default: "1"
+
+env:
+  AWS_REGION: eu-north-1
+  ECR_REPOSITORY: data-architecture-ai
+  ECS_CLUSTER: data-architecture-ai
+  ECS_SERVICE: data-architecture-ai
+  STACK_NAME: cgs-ai-analyst-agent-project
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  build-push-deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: ecr-login
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and push Docker image
+        id: build
+        env:
+          ECR_REGISTRY: ${{ steps.ecr-login.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          docker build --platform linux/amd64 \
+            -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG \
+            -t $ECR_REGISTRY/$ECR_REPOSITORY:latest \
+            .
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:latest
+          echo "image=$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Force ECS redeployment
+        env:
+          DESIRED_COUNT: ${{ github.event.inputs.desired_count || '1' }}
+          STREAMLIT_DESIRED_COUNT: ${{ github.event.inputs.streamlit_desired_count || '1' }}
+        run: |
+          aws ecs update-service \
+            --cluster $ECS_CLUSTER \
+            --service $ECS_SERVICE \
+            --force-new-deployment \
+            --desired-count $DESIRED_COUNT \
+            --region $AWS_REGION
+          aws ecs update-service \
+            --cluster $ECS_CLUSTER \
+            --service data-architecture-ai-streamlit \
+            --force-new-deployment \
+            --desired-count $STREAMLIT_DESIRED_COUNT \
+            --region $AWS_REGION
+
+      - name: Wait for service stability
+        run: |
+          echo "Waiting for ECS services to stabilize..."
+          aws ecs wait services-stable \
+            --cluster $ECS_CLUSTER \
+            --services $ECS_SERVICE data-architecture-ai-streamlit \
+            --region $AWS_REGION || echo "Timeout waiting for stability (services may still be deploying)"
+
+      - name: Print URLs
+        run: |
+          ALB_URL=$(aws cloudformation describe-stacks \
+            --stack-name $STACK_NAME \
+            --region $AWS_REGION \
+            --query "Stacks[0].Outputs[?OutputKey=='LoadBalancerUrl'].OutputValue" \
+            --output text)
+          STREAMLIT_URL=$(aws cloudformation describe-stacks \
+            --stack-name $STACK_NAME \
+            --region $AWS_REGION \
+            --query "Stacks[0].Outputs[?OutputKey=='StreamlitUrl'].OutputValue" \
+            --output text)
+          echo "🚀 API deployed: $ALB_URL"
+          echo "🖥️  Streamlit: $STREAMLIT_URL"
+          echo "Health check: $ALB_URL/health"

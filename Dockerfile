@@ -10,9 +10,12 @@ COPY requirements.txt /app/
 RUN pip install --upgrade pip && pip install -r requirements.txt
 COPY src /app/src
 COPY scripts /app/scripts
+COPY config /app/config
+COPY .streamlit /app/.streamlit
 COPY data /app/data
+COPY assets /app/assets
 USER app
-EXPOSE 8080
+EXPOSE 8080 8501
 HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=3 \
   CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/health')"
-ENTRYPOINT ["python", "/app/scripts/serve.py"]
+CMD ["python", "/app/scripts/serve.py"]

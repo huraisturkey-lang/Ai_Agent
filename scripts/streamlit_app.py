@@ -26,11 +26,14 @@ import hmac
 
 import requests
 import streamlit as st
+import yaml
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SRC_PATH = os.path.join(PROJECT_ROOT, 'src')
 if SRC_PATH not in sys.path:
     sys.path.insert(0, SRC_PATH)
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
 
 from llm_sql.config import SettingsError, get_settings, require_runtime_settings
 from llm_sql.runner import build_athena_service
@@ -39,6 +42,23 @@ from llm_sql.connectors.registry import (
     get_connector_from_env,
     list_connections,
     load_connections,
+)
+from scripts.sidebar_helpers import (
+    CONNECTOR_ORDER,
+    CONNECTOR_ICONS,
+    DIALECT_LABELS,
+    group_connectors,
+    get_status_icon,
+    resolve_active_selection,
+    get_connector_metadata,
+    get_connector_display_name,
+    get_config_filename,
+    extract_status_panel_data,
+    extract_template_fields,
+    validate_form_data,
+    build_yaml_config,
+    format_test_success,
+    format_test_failure,
 )
 
 # ── Logo path ────────────────────────────────────────────────────────────────
@@ -342,6 +362,82 @@ def _inject_custom_css():
         width: 140px;
     }
 
+    /* ── Connector Picker Cards ─────────────────────────────────────────── */
+    .connector-group-title {
+        font-size: 0.65rem;
+        font-weight: 600;
+        color: #94A3B8;
+        text-transform: uppercase;
+        letter-spacing: 0.08em;
+        margin: 0.75rem 0 0.4rem;
+    }
+    .connector-card {
+        display: flex;
+        align-items: center;
+        gap: 0.5rem;
+        padding: 0.5rem 0.75rem;
+        border-radius: 10px;
+        border: 1px solid #E2E8F0;
+        background: #FFFFFF;
+        margin-bottom: 0.35rem;
+        cursor: pointer;
+        transition: all 0.15s ease;
+    }
+    .connector-card:hover {
+        border-color: #1976D2;
+        background: #F0F7FF;
+    }
+    .connector-card.active {
+        border-color: #1976D2;
+        background: #EBF5FF;
+        box-shadow: 0 0 0 1px #1976D2;
+    }
+    .connector-card-icon {
+        font-size: 1.1rem;
+        width: 24px;
+        text-align: center;
+    }
+    .connector-card-name {
+        flex: 1;
+        font-size: 0.8rem;
+        font-weight: 500;
+        color: #334155;
+    }
+    .connector-card-status {
+        font-size: 0.75rem;
+    }
+    .connector-status-configured {
+        color: #059669;
+        font-size: 0.7rem;
+    }
+    .connector-status-unconfigured {
+        color: #D97706;
+        font-size: 0.7rem;
+    }
+
+    /* ── Status Panel ───────────────────────────────────────────────────── */
+    .status-panel {
+        padding: 0.6rem 0.75rem;
+        border-radius: 10px;
+        background: #F8FAFC;
+        border: 1px solid #E2E8F0;
+        margin: 0.5rem 0;
+        font-size: 0.78rem;
+        color: #475569;
+        line-height: 1.7;
+    }
+    .status-panel strong {
+        color: #1E293B;
+    }
+    .status-connected {
+        color: #059669;
+        font-weight: 500;
+    }
+    .status-unconfigured {
+        color: #D97706;
+        font-weight: 500;
+    }
+
     /* ── Hide Streamlit defaults ────────────────────────────────────────── */
     #MainMenu {visibility: hidden;}
     footer {visibility: hidden;}
@@ -441,18 +537,8 @@ def _ask(question: str) -> str:
     if _api_base_url():
         return _ask_remote(question)
 
-    # Check which data source is selected in the sidebar
-    CONNECTOR_OPTIONS = {
-        '☁️ Athena (AWS)': 'athena',
-        '🔴 Redshift (AWS)': 'redshift',
-        '🐘 RDS PostgreSQL': 'rds_postgres',
-        '🐬 RDS MySQL': 'rds_mysql',
-        '❄️ Snowflake': 'snowflake',
-        '🧱 Databricks': 'databricks',
-    }
-
-    active_source = st.session_state.get('active_source', '☁️ Athena (AWS)')
-    selected_type = CONNECTOR_OPTIONS.get(active_source, '')
+    # Get selected connector type from the new picker
+    selected_type = st.session_state.get('active_connector_type', 'athena')
 
     # If Athena is selected, use the existing local service (backward compatible)
     if selected_type == 'athena':
@@ -471,28 +557,20 @@ def _ask(question: str) -> str:
     if matching_conn:
         try:
             connector = get_connector(matching_conn)
-            if hasattr(connector, 'run_query'):
-                return connector.run_query(question)
-            else:
-                catalog, tables = connector.get_schema()
-                return (
-                    f"✅ Connected to **{matching_conn}** ({selected_type}). "
-                    f"Found {len(tables)} tables. "
-                    f"Full LLM-powered query support coming soon."
-                )
+            return connector.run_query(question)
+        except ImportError as e:
+            return f"⚠️ {e}"
         except NotImplementedError as e:
             return f"⚠️ {e}"
         except Exception as e:
             return f"⚠️ Connector error: {e}"
 
-    # No config file found for this type
+    # No config file found — trigger the unconfigured banner
+    display_name = get_connector_display_name(selected_type)
+    trigger_unconfigured_banner(selected_type)
     return (
-        f"⚠️ **{active_source}** is not configured yet.\n\n"
-        f"To set it up:\n"
-        f"1. Copy `config/connections/{selected_type}.yaml.template` → "
-        f"`config/connections/{selected_type}.yaml`\n"
-        f"2. Fill in your connection details\n"
-        f"3. Restart the app"
+        f"⚠️ **{display_name}** is not configured. "
+        f"Use the Configure panel in the sidebar to set it up."
     )
 
 
@@ -572,6 +650,418 @@ def _render_suggestions():
             ):
                 st.session_state['pending_question'] = text
                 st.rerun()
+
+
+def _render_connector_picker() -> str:
+    """Render the grouped connector picker and return the selected connector type.
+
+    Displays connectors as a clean selectbox with emoji icons and status indicators.
+    Persists selection to session state.
+
+    Returns:
+        The selected ConnectorType string (e.g. 'athena', 'redshift').
+    """
+    config_dir = Path("config/connections")
+
+    # Get all connector type keys from the fixed order
+    all_types = [entry[0] for entry in CONNECTOR_ORDER]
+
+    # Build display options with icons
+    display_names: dict[str, str] = {entry[0]: entry[1] for entry in CONNECTOR_ORDER}
+
+    # Build selectbox options: "icon name"
+    options_map: dict[str, str] = {}  # display_label -> type_key
+    option_labels: list[str] = []
+
+    for ct in all_types:
+        icon = CONNECTOR_ICONS.get(ct, "❓")
+        name = display_names.get(ct, ct)
+        status = get_status_icon(ct, config_dir)
+        label = f"{icon} {name} {status}"
+        option_labels.append(label)
+        options_map[label] = ct
+
+    # Current selection
+    current_type = st.session_state.get("active_connector_type", all_types[0])
+    current_idx = all_types.index(current_type) if current_type in all_types else 0
+
+    selected_label = st.selectbox(
+        "Data source",
+        options=option_labels,
+        index=current_idx,
+        key="connector_selectbox",
+        label_visibility="collapsed",
+    )
+
+    resolved = options_map.get(selected_label, all_types[0])
+
+    # Show grouped overview below the selector
+    groups = group_connectors(all_types)
+    for group_name in ("AWS Native", "External Platforms"):
+        connectors_in_group = groups.get(group_name, [])
+        if not connectors_in_group:
+            continue
+
+        st.markdown(f'<div class="connector-group-title">{group_name}</div>', unsafe_allow_html=True)
+
+        cards_html = ""
+        for ct in connectors_in_group:
+            icon = CONNECTOR_ICONS.get(ct, "❓")
+            name = display_names.get(ct, ct)
+            status = get_status_icon(ct, config_dir)
+            is_active = "active" if ct == resolved else ""
+            status_class = "connector-status-configured" if status == "✅" else "connector-status-unconfigured"
+            status_text = "Connected" if status == "✅" else "Not configured"
+
+            cards_html += (
+                f'<div class="connector-card {is_active}">'
+                f'<span class="connector-card-icon">{icon}</span>'
+                f'<span class="connector-card-name">{name}</span>'
+                f'<span class="{status_class}">{status_text}</span>'
+                f'</div>'
+            )
+
+        st.markdown(cards_html, unsafe_allow_html=True)
+
+    # Persist to session state
+    st.session_state["active_connector_type"] = resolved
+
+    return resolved
+
+
+# ── Config directory for connections ─────────────────────────────────────────
+_CONFIG_DIR = Path(PROJECT_ROOT) / "config" / "connections"
+
+
+def _render_status_panel(connector_type: str) -> None:
+    """Render connection status panel for the selected connector type.
+
+    Handles five states:
+    - Athena: displays Glue DB, region, workgroup from env/session state
+    - Configured External_Connector: displays type, host/account, database, status
+    - Unconfigured: displays setup prompt with required fields from template
+    - Unreadable config: displays error with file path
+    - Removed/disabled config: displays warning with button to open config form
+    """
+    # ── Athena special case ──
+    if connector_type == "athena":
+        glue_db = os.environ.get(
+            "GLUE_DB_NAME", st.session_state.get("cfg_glue_db", "N/A")
+        )
+        region = os.environ.get(
+            "AWS_REGION", st.session_state.get("cfg_region", "N/A")
+        )
+        workgroup = os.environ.get(
+            "ATHENA_WORKGROUP", st.session_state.get("cfg_workgroup", "N/A")
+        )
+        st.markdown(
+            f'<div class="info-table">'
+            f"<strong>Glue DB:</strong> {glue_db}<br>"
+            f"<strong>Region:</strong> {region}<br>"
+            f"<strong>Workgroup:</strong> {workgroup}"
+            f"</div>",
+            unsafe_allow_html=True,
+        )
+        return
+
+    # ── External connectors: scan config directory ──
+    config_file_path: Path | None = None
+    config_data: dict | None = None
+    config_error: str | None = None
+    config_disabled: bool = False
+
+    if _CONFIG_DIR.is_dir():
+        for yaml_file in _CONFIG_DIR.glob("*.yaml"):
+            try:
+                with open(yaml_file, "r") as f:
+                    data = yaml.safe_load(f)
+                if not isinstance(data, dict):
+                    continue
+                if data.get("type") == connector_type:
+                    config_file_path = yaml_file
+                    if data.get("enabled") is True:
+                        config_data = data
+                    else:
+                        # File exists but disabled
+                        config_disabled = True
+                    break
+            except (yaml.YAMLError, OSError) as exc:
+                # File found but unreadable/malformed
+                config_file_path = yaml_file
+                config_error = str(exc)
+                break
+
+    # ── State: Configured and enabled ──
+    if config_data is not None:
+        panel = extract_status_panel_data(config_data)
+        status_class = "status-connected" if panel["status"] == "Connected" else ""
+        dialect = DIALECT_LABELS.get(connector_type, panel["type"])
+        st.markdown(
+            f'<div class="status-panel">'
+            f'<strong>{dialect}</strong><br>'
+            f'📍 {panel["host_or_account"]}<br>'
+            f'🗄️ {panel["database"]}<br>'
+            f'<span class="{status_class}">● {panel["status"]}</span>'
+            f'</div>',
+            unsafe_allow_html=True,
+        )
+        return
+
+    # ── State: Unreadable/malformed config ──
+    if config_error is not None and config_file_path is not None:
+        st.markdown(
+            f'<div class="status-panel" style="border-color:#FCA5A5;">'
+            f'⚠️ Config error<br>'
+            f'<span style="font-size:0.7rem;color:#94A3B8;">{config_file_path.name}</span>'
+            f'</div>',
+            unsafe_allow_html=True,
+        )
+        return
+
+    # ── State: Config exists but disabled (removed) ──
+    if config_disabled and config_file_path is not None:
+        st.markdown(
+            '<div class="status-panel" style="border-color:#FDE68A;">'
+            '⚠️ Configuration disabled'
+            '</div>',
+            unsafe_allow_html=True,
+        )
+        if st.button(
+            "🔧 Re-configure",
+            key=f"reconfig_{connector_type}",
+        ):
+            st.session_state["config_form_expanded"] = True
+        return
+
+    # ── State: Unconfigured - try to load template ──
+    file_basename = get_config_filename(connector_type)
+    template_path = _CONFIG_DIR / f"{file_basename}.yaml.template"
+    display_name = get_connector_display_name(connector_type)
+    dialect = DIALECT_LABELS.get(connector_type, connector_type)
+    st.markdown(
+        f'<div class="status-panel">'
+        f'<span class="status-unconfigured">○ Not configured</span><br>'
+        f'<span style="font-size:0.72rem;color:#64748B;">{dialect}</span>'
+        f'</div>',
+        unsafe_allow_html=True,
+    )
+
+
+def _render_config_form(connector_type: str) -> None:
+    """Render inline configuration form for the selected connector type.
+
+    Loads the .yaml.template file to determine field definitions, pre-populates
+    from existing config if present with enabled: true, validates on submit,
+    and writes YAML to config/connections/.
+    """
+    # Determine if form should be expanded
+    form_expanded = st.session_state.get("config_form_expanded", False)
+
+    # Only expand if explicitly requested (not auto-expand for unconfigured)
+    should_expand = form_expanded
+
+    with st.expander(f"🔧 Configure {get_connector_display_name(connector_type)}", expanded=should_expand):
+        # Load template
+        file_basename = get_config_filename(connector_type)
+        template_path = _CONFIG_DIR / f"{file_basename}.yaml.template"
+        if not template_path.exists():
+            st.error("Template unavailable")
+            return
+
+        # Extract field definitions from template
+        fields = extract_template_fields(template_path)
+
+        # Pre-populate from existing config if present with enabled: true
+        existing_values: dict[str, str] = {}
+        existing_name: str = ""
+        if _CONFIG_DIR.is_dir():
+            for yaml_file in _CONFIG_DIR.glob("*.yaml"):
+                try:
+                    with open(yaml_file, "r") as f:
+                        data = yaml.safe_load(f)
+                    if (
+                        isinstance(data, dict)
+                        and data.get("type") == connector_type
+                        and data.get("enabled") is True
+                    ):
+                        settings = data.get("settings", {})
+                        if isinstance(settings, dict):
+                            existing_values = {k: str(v) for k, v in settings.items()}
+                        existing_name = data.get("name", "")
+                        break
+                except (yaml.YAMLError, OSError):
+                    continue
+
+        # Render form
+        with st.form(f"config_form_{connector_type}"):
+            # Connection name field
+            name_value = existing_name if existing_name else ""
+            connection_name = st.text_input(
+                "Connection Name",
+                value=name_value,
+                placeholder="My Connection",
+                key=f"config_{connector_type}_name",
+            )
+
+            # Settings fields from template
+            form_values: dict[str, str] = {}
+            for field in fields:
+                field_key = field["key"]
+                placeholder = field["placeholder"]
+
+                # Determine if secret field
+                is_secret = any(
+                    keyword in field_key.lower()
+                    for keyword in ("secret", "token", "password")
+                )
+
+                # Default value from existing config or empty
+                default_value = existing_values.get(field_key, "")
+
+                input_type = "password" if is_secret else "default"
+                form_values[field_key] = st.text_input(
+                    label=field_key,
+                    value=default_value,
+                    placeholder=placeholder,
+                    type=input_type,
+                    key=f"config_{connector_type}_{field_key}",
+                )
+
+            # Submit button
+            submitted = st.form_submit_button("Save Configuration")
+
+        # Handle submission outside the form context
+        if submitted:
+            # Collect field names for validation
+            field_names = [f["key"] for f in fields]
+
+            # Validate form data
+            errors = validate_form_data(field_names, form_values)
+
+            if errors:
+                for field_name, msg in errors.items():
+                    st.error(f"❌ {field_name}: {msg}")
+            else:
+                # Build config
+                settings_dict = {k: v for k, v in form_values.items()}
+                config_name = connection_name.strip() if connection_name else connector_type
+                config_data = build_yaml_config(connector_type, config_name, settings_dict)
+
+                # Write YAML to config/connections/
+                output_path = _CONFIG_DIR / f"{file_basename}.yaml"
+                try:
+                    _CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+                    with open(output_path, "w") as f:
+                        yaml.dump(config_data, f, default_flow_style=False)
+
+                    # Update session state
+                    st.session_state["config_form_expanded"] = False
+                    st.success("Configuration saved!")
+                    st.rerun()
+                except OSError as exc:
+                    st.error(f"Failed to write configuration: {exc}")
+
+
+def _render_connection_tester(connector_type: str) -> None:
+    """Render test connection button and results for the selected connector.
+
+    Only displays the "Test Connection" button when the connector is configured
+    (i.e. a .yaml file with matching type and enabled: true exists in _CONFIG_DIR).
+    On click, invokes get_connector(name).test_connection() and displays the result.
+    Results are cached in st.session_state['test_result_{type}'].
+    """
+    from datetime import datetime
+
+    # ── Check if connector is configured ──
+    if not _CONFIG_DIR.is_dir():
+        return
+
+    configured_name: str | None = None
+    for yaml_file in _CONFIG_DIR.glob("*.yaml"):
+        try:
+            with open(yaml_file, "r") as f:
+                data = yaml.safe_load(f)
+            if not isinstance(data, dict):
+                continue
+            if data.get("type") == connector_type and data.get("enabled") is True:
+                configured_name = data.get("name", yaml_file.stem)
+                break
+        except (yaml.YAMLError, OSError):
+            continue
+
+    if configured_name is None:
+        return
+
+    # ── Show "Test Connection" button ──
+    if st.button("🔌 Test Connection", key=f"test_conn_{connector_type}"):
+        with st.spinner("Testing connection..."):
+            try:
+                connector = get_connector(configured_name)
+                connector.test_connection()
+
+                # Success
+                dialect = DIALECT_LABELS.get(connector_type, "Unknown")
+                timestamp = datetime.now().isoformat()
+                result = {
+                    "success": True,
+                    "message": format_test_success(dialect, timestamp),
+                    "timestamp": timestamp,
+                }
+            except Exception as exc:
+                result = {
+                    "success": False,
+                    "message": format_test_failure(str(exc)),
+                    "timestamp": "",
+                }
+
+            # Cache result in session state
+            st.session_state[f"test_result_{connector_type}"] = result
+
+    # ── Display cached result (if any) ──
+    cached = st.session_state.get(f"test_result_{connector_type}")
+    if cached:
+        if cached["success"]:
+            st.success(cached["message"])
+        else:
+            st.error(cached["message"])
+
+
+def trigger_unconfigured_banner(connector_type: str) -> None:
+    """Trigger the unconfigured connector banner in the sidebar.
+
+    Sets session state flags so that _check_and_show_unconfigured_banner
+    will display the banner on the next render cycle. Called from query
+    handling logic when an unconfigured connector is active.
+    """
+    st.session_state['show_unconfigured_banner'] = True
+    st.session_state['banner_connector_type'] = connector_type
+
+
+def _check_and_show_unconfigured_banner(connector_type: str) -> None:
+    """Show an informational banner if the active connector is unconfigured.
+
+    The banner states the connector type name is not configured and includes
+    a button to expand the Inline_Config_Form. It persists until the user
+    configures the connector or selects a different type.
+    """
+    show_banner = st.session_state.get('show_unconfigured_banner', False)
+    banner_type = st.session_state.get('banner_connector_type', '')
+
+    if not show_banner:
+        return
+
+    # If banner refers to a different connector type, clear it
+    if banner_type != connector_type:
+        st.session_state['show_unconfigured_banner'] = False
+        st.session_state['banner_connector_type'] = ''
+        return
+
+    # Show the banner
+    display_name = get_connector_display_name(connector_type)
+    st.warning(f"⚠️ {display_name} is not configured. Please configure it to run queries.")
+
+    if st.button("🔧 Configure", key="banner_configure_btn"):
+        st.session_state['config_form_expanded'] = True
 
 
 def _render_sidebar():
@@ -701,57 +1191,20 @@ def _render_sidebar():
 
         st.divider()
 
-        # ── Data Source Picker ──
+        # ── Data Source (NEW) ──
         st.markdown(
             '<div class="sidebar-section-title">📊 Data Source</div>',
             unsafe_allow_html=True,
         )
 
-        # Always show all supported connector types
-        CONNECTOR_OPTIONS = {
-            '☁️ Athena (AWS)': 'athena',
-            '🔴 Redshift (AWS)': 'redshift',
-            '🐘 RDS PostgreSQL': 'rds_postgres',
-            '🐬 RDS MySQL': 'rds_mysql',
-            '❄️ Snowflake': 'snowflake',
-            '🧱 Databricks': 'databricks',
-        }
+        selected_type = _render_connector_picker()
+        _render_status_panel(selected_type)
+        _render_config_form(selected_type)
+        _render_connection_tester(selected_type)
+        _check_and_show_unconfigured_banner(selected_type)
 
-        # Also include any configured connections from YAML files
-        connections = load_connections()
-        configured_names = list(connections.keys())
-
-        # Build the full options list
-        all_options = list(CONNECTOR_OPTIONS.keys())
-        for name in configured_names:
-            if name not in all_options:
-                conn_type = connections[name].get('type', 'unknown')
-                all_options.append(f"📁 {name} ({conn_type})")
-
-        current = st.session_state.get('active_source', all_options[0])
-        if current not in all_options:
-            current = all_options[0]
-
-        selected = st.selectbox(
-            'Active data source',
-            options=all_options,
-            index=all_options.index(current),
-            key='source_selector',
-            label_visibility='collapsed',
-        )
-        st.session_state['active_source'] = selected
-
-        # Show connection status for selected source
-        selected_type = CONNECTOR_OPTIONS.get(selected, '')
-        if selected_type:
-            # Check if any loaded connection matches this type
-            has_config = any(
-                c.get('type') == selected_type for c in connections.values()
-            )
-            if has_config or selected_type == 'athena':
-                st.caption(f"✅ Type: `{selected_type}` — configured")
-            else:
-                st.caption(f"⚠️ No `.yaml` config found for `{selected_type}`")
+        # Backward compatibility: update active_source from active_connector_type
+        st.session_state['active_source'] = st.session_state.get('active_connector_type', 'athena')
 
         st.divider()
 
@@ -786,18 +1239,25 @@ def _render_sidebar():
 def _check_login() -> bool:
     """Display login form and validate credentials.
 
-    Credentials are read from environment variables:
-      - APP_USERNAME (default: admin)
-      - APP_PASSWORD (default: cloudage)
+    Credentials MUST be set via environment variables:
+      - APP_USERNAME (required)
+      - APP_PASSWORD (required)
 
     Returns True if authenticated, False otherwise.
     """
     if st.session_state.get('authenticated'):
         return True
 
-    # Get credentials from env (or defaults for training)
-    valid_username = os.environ.get('APP_USERNAME', 'admin')
-    valid_password = os.environ.get('APP_PASSWORD', 'cloudage')
+    # Credentials must be explicitly configured - no insecure defaults
+    valid_username = os.environ.get('APP_USERNAME', '')
+    valid_password = os.environ.get('APP_PASSWORD', '')
+
+    if not valid_username or not valid_password:
+        st.error(
+            "Authentication not configured. "
+            "Set APP_USERNAME and APP_PASSWORD environment variables."
+        )
+        return False
 
     logo_uri = _get_logo_b64()
 
@@ -841,7 +1301,16 @@ def _check_login() -> bool:
             submitted = st.form_submit_button('Sign In', use_container_width=True)
 
             if submitted:
-                if username == valid_username and password == valid_password:
+                # Use constant-time comparison to prevent timing attacks
+                user_ok = hmac.compare_digest(
+                    username.encode('utf-8'),
+                    valid_username.encode('utf-8'),
+                )
+                pass_ok = hmac.compare_digest(
+                    hashlib.sha256(password.encode('utf-8')).hexdigest(),
+                    hashlib.sha256(valid_password.encode('utf-8')).hexdigest(),
+                )
+                if user_ok and pass_ok:
                     st.session_state['authenticated'] = True
                     st.session_state['user'] = username
                     st.rerun()
@@ -856,16 +1325,17 @@ def main() -> None:
         page_title='CloudAge — Data Intelligence',
         page_icon='☁️',
         layout='centered',
-        initial_sidebar_state='collapsed',
+        initial_sidebar_state='expanded',
     )
 
     _inject_custom_css()
 
+    # ── Always render sidebar (logo + connectors visible even before login) ──
+    _render_sidebar()
+
     # ── Login gate ──
     if not _check_login():
         return
-
-    _render_sidebar()
 
     # Initialize state
     if 'messages' not in st.session_state:

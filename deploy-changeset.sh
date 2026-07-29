@@ -14,6 +14,9 @@ STACK_NAME="cgs-ai-analyst-agent-project"
 REGION="${AWS_REGION:-eu-north-1}"
 IAM_USER="${IAM_USER:-$(aws iam get-user --query 'User.UserName' --output text 2>/dev/null || echo 'unknown')}"
 DESIRED_COUNT="${DESIRED_COUNT:-1}"
+STREAMLIT_DESIRED_COUNT="${STREAMLIT_DESIRED_COUNT:-1}"
+STREAMLIT_USERNAME="${STREAMLIT_USERNAME:-}"
+STREAMLIT_PASSWORD="${STREAMLIT_PASSWORD:-}"
 AUTO_MODE=false
 
 # Parse flags
@@ -45,14 +48,19 @@ fi
 # ECS service getting stuck waiting for a container image that doesn't exist yet.
 # The image is pushed after stack creation, then the service is scaled up.
 DEPLOY_DESIRED_COUNT="$DESIRED_COUNT"
+DEPLOY_STREAMLIT_DESIRED_COUNT="$STREAMLIT_DESIRED_COUNT"
 if $AUTO_MODE && [[ "$CHANGE_SET_TYPE" == "CREATE" ]]; then
   DEPLOY_DESIRED_COUNT="0"
+  DEPLOY_STREAMLIT_DESIRED_COUNT="0"
 fi
 
 # ── CloudFormation parameters ─────────────────────────────────────────────
 CFN_PARAMETERS=$(cat <<EOF
 [
   {"ParameterKey": "DesiredCount",              "ParameterValue": "${DEPLOY_DESIRED_COUNT}"},
+  {"ParameterKey": "StreamlitDesiredCount",     "ParameterValue": "${DEPLOY_STREAMLIT_DESIRED_COUNT}"},
+  {"ParameterKey": "StreamlitUsername",         "ParameterValue": "${STREAMLIT_USERNAME}"},
+  {"ParameterKey": "StreamlitPassword",         "ParameterValue": "${STREAMLIT_PASSWORD}"},
   {"ParameterKey": "PrimaryDataBucketName",     "ParameterValue": "${PRIMARY_DATA_BUCKET_NAME}"},
   {"ParameterKey": "CreatePrimaryDataBucket",   "ParameterValue": "${CREATE_PRIMARY_DATA_BUCKET}"},
   {"ParameterKey": "AthenaWorkgroupName",       "ParameterValue": "${ATHENA_WORKGROUP_NAME}"},
@@ -61,7 +69,8 @@ CFN_PARAMETERS=$(cat <<EOF
   {"ParameterKey": "CarsGlueDatabaseName",      "ParameterValue": "${CARS_GLUE_DATABASE_NAME}"},
   {"ParameterKey": "CreateLibraryGlueDatabase", "ParameterValue": "${CREATE_LIBRARY_GLUE_DATABASE}"},
   {"ParameterKey": "CreateCarsGlueDatabase",    "ParameterValue": "${CREATE_CARS_GLUE_DATABASE}"},
-  {"ParameterKey": "CreateAppLogGroup",         "ParameterValue": "${CREATE_APP_LOG_GROUP}"}
+  {"ParameterKey": "CreateAppLogGroup",         "ParameterValue": "${CREATE_APP_LOG_GROUP}"},
+  {"ParameterKey": "CreateCrawlers",            "ParameterValue": "false"}
 ]
 EOF
 )
@@ -199,7 +208,7 @@ if $AUTO_MODE; then
   echo "=========================================="
   echo "Building and pushing container image..."
   echo "=========================================="
-  DESIRED_COUNT="$DESIRED_COUNT" ./scripts/push_ecr.sh
+  DESIRED_COUNT="$DESIRED_COUNT" STREAMLIT_DESIRED_COUNT="$STREAMLIT_DESIRED_COUNT" ./scripts/push_ecr.sh
 
   echo ""
   echo "=========================================="
@@ -249,10 +258,18 @@ if $AUTO_MODE; then
     --region "$REGION" \
     --query "Stacks[0].Outputs[?OutputKey=='LoadBalancerUrl'].OutputValue" \
     --output text 2>/dev/null || true)"
+  STREAMLIT_URL="$(aws cloudformation describe-stacks \
+    --stack-name "$STACK_NAME" \
+    --region "$REGION" \
+    --query "Stacks[0].Outputs[?OutputKey=='StreamlitUrl'].OutputValue" \
+    --output text 2>/dev/null || true)"
   if [[ -n "$ALB_URL" && "$ALB_URL" != "None" ]]; then
     echo "🌐 API URL:     $ALB_URL"
     echo "❤️  Health:      $ALB_URL/health"
     echo "💬 Query:       curl -X POST $ALB_URL/query -H 'Content-Type: application/json' -d '{\"question\":\"How many books?\"}'"
+  fi
+  if [[ -n "$STREAMLIT_URL" && "$STREAMLIT_URL" != "None" ]]; then
+    echo "🖥️  Streamlit:   $STREAMLIT_URL"
   fi
 else
   # Review mode — show next steps

@@ -1,16 +1,27 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Production dependencies
+# ─────────────────────────────────────────────────────────────────────────────
 sqlalchemy>=2.0,<3.0
 pandas>=1.5,<3.0
 boto3>=1.35.0,<2.0
 pyathena>=3.10,<4.0
 pymysql>=1.1.0,<2.0
+psycopg2-binary>=2.9.9,<3.0
 langchain>=0.2,<0.4
 langchain-community>=0.2,<0.4
 langchain-experimental>=0.0.60,<0.1
 requests>=2.31.0,<3.0
-pydantic>=1.10.0,<2.0
+pydantic>=1.10.0,<3.0
+pydantic-settings>=2.0.0,<3.0; python_version >= "3.8"
 python-dotenv>=1.0.0,<2.0
-fastapi>=0.110.0,<1.0
+fastapi>=0.100.0,<1.0
 uvicorn>=0.27.0,<1.0
-streamlit>=1.32.0,<2.0
 pyyaml>=6.0,<7.0
-hypothesis>=6.0,<7.0
+streamlit>=1.32.0,<2.0
+
+# ─────────────────────────────────────────────────────────────────────────────
+# External connector drivers
+# ─────────────────────────────────────────────────────────────────────────────
+redshift-connector>=2.1.0,<3.0
+snowflake-connector-python>=3.6.0,<4.0
+databricks-sql-connector>=3.1.0,<4.0

@@ -7,7 +7,15 @@ from __future__ import annotations
 
 from functools import lru_cache
 
-from pydantic import BaseSettings, Field, validator
+try:
+    # Pydantic v2 (pydantic-settings package)
+    from pydantic_settings import BaseSettings
+    from pydantic import Field, field_validator
+    _PYDANTIC_V2 = True
+except ImportError:
+    # Pydantic v1
+    from pydantic import BaseSettings, Field, validator
+    _PYDANTIC_V2 = False
 
 try:
     # optional: allow .env for local development
@@ -22,45 +30,85 @@ class SettingsError(RuntimeError):
     """Raised when required runtime settings are missing."""
 
 
-class Settings(BaseSettings):
-    # Runtime-required settings (validated via require_runtime_settings).
-    glue_db_name: str | None = Field(None, env='GLUE_DB_NAME')
-    project_files_bucket: str | None = Field(None, env='PROJECT_FILES_BUCKET')
-    region: str = Field('eu-north-1', env='AWS_REGION')
+if _PYDANTIC_V2:
+    class Settings(BaseSettings):
+        # Runtime-required settings (validated via require_runtime_settings).
+        glue_db_name: str | None = Field(None, validation_alias='GLUE_DB_NAME')
+        project_files_bucket: str | None = Field(None, validation_alias='PROJECT_FILES_BUCKET')
+        region: str = Field('eu-north-1', validation_alias='AWS_REGION')
 
-    # Bedrock / LLM configuration (use inference profile IDs in EU/US, e.g. eu.amazon.nova-micro-v1:0)
-    bedrock_model: str = Field('eu.amazon.nova-micro-v1:0', env='BEDROCK_MODEL')
-    bedrock_max_retries: int = Field(4, env='BEDROCK_MAX_RETRIES', ge=1)
-    bedrock_retry_base_delay: float = Field(1.0, env='BEDROCK_RETRY_BASE_DELAY', gt=0)
+        # Bedrock / LLM configuration
+        bedrock_model: str = Field('eu.amazon.nova-micro-v1:0', validation_alias='BEDROCK_MODEL')
+        bedrock_max_retries: int = Field(4, validation_alias='BEDROCK_MAX_RETRIES', ge=1)
+        bedrock_retry_base_delay: float = Field(1.0, validation_alias='BEDROCK_RETRY_BASE_DELAY', gt=0)
 
-    # Athena / query settings
-    athena_workgroup: str = Field('primary', env='ATHENA_WORKGROUP')
-    # Set true when the workgroup uses Athena managed query results (no S3 output path).
-    athena_use_managed_results: bool | None = Field(None, env='ATHENA_USE_MANAGED_RESULTS')
-    # Optional Secrets Manager secret containing credentials or overrides.
-    secrets_manager_secret: str | None = Field(None, env='SECRETS_MANAGER_SECRET')
-    max_result_rows: int = Field(200, env='MAX_RESULT_ROWS', ge=1, le=10000)
-    max_question_chars: int = Field(1000, env='MAX_QUESTION_CHARS', ge=64, le=10000)
-    log_level: str = Field('INFO', env='LOG_LEVEL')
+        # Athena / query settings
+        athena_workgroup: str = Field('primary', validation_alias='ATHENA_WORKGROUP')
+        athena_use_managed_results: bool | None = Field(None, validation_alias='ATHENA_USE_MANAGED_RESULTS')
+        secrets_manager_secret: str | None = Field(None, validation_alias='SECRETS_MANAGER_SECRET')
+        max_result_rows: int = Field(200, validation_alias='MAX_RESULT_ROWS', ge=1, le=10000)
+        max_question_chars: int = Field(1000, validation_alias='MAX_QUESTION_CHARS', ge=64, le=10000)
+        log_level: str = Field('INFO', validation_alias='LOG_LEVEL')
 
-    # HTTP API (ECS Fargate)
-    api_port: int = Field(8080, env='PORT', ge=1024, le=65535)
-    api_key: str | None = Field(None, env='API_KEY')
+        # HTTP API (ECS Fargate)
+        api_port: int = Field(8080, validation_alias='PORT', ge=1024, le=65535)
+        api_key: str | None = Field(None, validation_alias='API_KEY')
 
-    @validator('log_level')
-    def normalize_log_level(cls, value: str) -> str:
-        normalized = value.upper()
-        allowed = {'DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'}
-        if normalized not in allowed:
-            raise ValueError(
-                'LOG_LEVEL must be one of: '
-                + ', '.join(sorted(allowed))
-            )
-        return normalized
+        @field_validator('log_level')
+        @classmethod
+        def normalize_log_level(cls, value: str) -> str:
+            normalized = value.upper()
+            allowed = {'DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'}
+            if normalized not in allowed:
+                raise ValueError(
+                    'LOG_LEVEL must be one of: '
+                    + ', '.join(sorted(allowed))
+                )
+            return normalized
 
-    class Config:
-        env_file = '.env'
-        env_file_encoding = 'utf-8'
+        class Config:
+            env_file = '.env'
+            env_file_encoding = 'utf-8'
+            populate_by_name = True
+
+else:
+    class Settings(BaseSettings):
+        # Runtime-required settings (validated via require_runtime_settings).
+        glue_db_name: str | None = Field(None, env='GLUE_DB_NAME')
+        project_files_bucket: str | None = Field(None, env='PROJECT_FILES_BUCKET')
+        region: str = Field('eu-north-1', env='AWS_REGION')
+
+        # Bedrock / LLM configuration
+        bedrock_model: str = Field('eu.amazon.nova-micro-v1:0', env='BEDROCK_MODEL')
+        bedrock_max_retries: int = Field(4, env='BEDROCK_MAX_RETRIES', ge=1)
+        bedrock_retry_base_delay: float = Field(1.0, env='BEDROCK_RETRY_BASE_DELAY', gt=0)
+
+        # Athena / query settings
+        athena_workgroup: str = Field('primary', env='ATHENA_WORKGROUP')
+        athena_use_managed_results: bool | None = Field(None, env='ATHENA_USE_MANAGED_RESULTS')
+        secrets_manager_secret: str | None = Field(None, env='SECRETS_MANAGER_SECRET')
+        max_result_rows: int = Field(200, env='MAX_RESULT_ROWS', ge=1, le=10000)
+        max_question_chars: int = Field(1000, env='MAX_QUESTION_CHARS', ge=64, le=10000)
+        log_level: str = Field('INFO', env='LOG_LEVEL')
+
+        # HTTP API (ECS Fargate)
+        api_port: int = Field(8080, env='PORT', ge=1024, le=65535)
+        api_key: str | None = Field(None, env='API_KEY')
+
+        @validator('log_level')
+        def normalize_log_level(cls, value: str) -> str:
+            normalized = value.upper()
+            allowed = {'DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'}
+            if normalized not in allowed:
+                raise ValueError(
+                    'LOG_LEVEL must be one of: '
+                    + ', '.join(sorted(allowed))
+                )
+            return normalized
+
+        class Config:
+            env_file = '.env'
+            env_file_encoding = 'utf-8'
 
 
 def resolve_bedrock_model(model: str, region: str) -> str:

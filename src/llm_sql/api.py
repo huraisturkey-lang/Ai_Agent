@@ -1,6 +1,7 @@
 """HTTP API for the Text-to-SQL service."""
 from __future__ import annotations
 
+import hmac
 import logging
 import os
 from typing import Optional
@@ -90,7 +91,7 @@ def _check_api_key(x_api_key: Optional[str]) -> None:
     expected = settings.api_key
     if not expected:
         return
-    if x_api_key != expected:
+    if not x_api_key or not hmac.compare_digest(x_api_key, expected):
         raise HTTPException(status_code=401, detail='Invalid or missing API key')
 
 

@@ -80,12 +80,15 @@ class DatabricksConnector(BaseConnector):
         conn = self._get_connection()
         try:
             cursor = conn.cursor()
-            cursor.execute(f"""
-                SELECT table_name, column_name
-                FROM {catalog}.information_schema.columns
-                WHERE table_schema = '{schema_name}'
-                ORDER BY table_name, ordinal_position
-            """)
+            # Databricks requires catalog prefix in the table reference
+            # but supports parameterized WHERE clauses
+            cursor.execute(
+                f"SELECT table_name, column_name "
+                f"FROM {catalog}.information_schema.columns "
+                f"WHERE table_schema = %(schema)s "
+                f"ORDER BY table_name, ordinal_position",
+                {"schema": schema_name},
+            )
             rows = cursor.fetchall()
         finally:
             conn.close()

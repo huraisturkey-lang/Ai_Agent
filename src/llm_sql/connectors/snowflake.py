@@ -87,12 +87,15 @@ class SnowflakeConnector(BaseConnector):
         conn = self._get_connection()
         try:
             cursor = conn.cursor()
-            cursor.execute(f"""
-                SELECT TABLE_NAME, COLUMN_NAME
-                FROM {database}.INFORMATION_SCHEMA.COLUMNS
-                WHERE TABLE_SCHEMA = '{schema_name}'
-                ORDER BY TABLE_NAME, ORDINAL_POSITION
-            """)
+            # Snowflake requires the database prefix in the table reference
+            # but supports parameterized WHERE clauses
+            cursor.execute(
+                f"SELECT TABLE_NAME, COLUMN_NAME "
+                f"FROM {database}.INFORMATION_SCHEMA.COLUMNS "
+                f"WHERE TABLE_SCHEMA = %s "
+                f"ORDER BY TABLE_NAME, ORDINAL_POSITION",
+                (schema_name,),
+            )
             rows = cursor.fetchall()
         finally:
             conn.close()

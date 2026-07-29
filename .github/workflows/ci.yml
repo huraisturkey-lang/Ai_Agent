@@ -22,7 +22,7 @@ jobs:
           pip install -r requirements.txt
 
       - name: Compile checks
-        run: python -m compileall src scripts run_smoke.py
+        run: python -m compileall src scripts lambda run_smoke.py
 
       - name: Unit tests
         env:

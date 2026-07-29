@@ -69,6 +69,26 @@ if aws cloudformation describe-stacks --stack-name "$STACK_NAME" --region "$REGI
       >/dev/null
     echo "ECS service ${SERVICE} redeployment started."
   fi
+
+  # Also redeploy Streamlit service
+  STREAMLIT_SERVICE="data-architecture-ai-streamlit"
+  STREAMLIT_COUNT="${STREAMLIT_DESIRED_COUNT:-1}"
+  STREAMLIT_STATUS="$(aws ecs describe-services \
+    --cluster "$CLUSTER" \
+    --services "$STREAMLIT_SERVICE" \
+    --region "$REGION" \
+    --query 'services[0].status' \
+    --output text 2>/dev/null || echo 'NOT_FOUND')"
+  if [[ "$STREAMLIT_STATUS" == "ACTIVE" ]]; then
+    aws ecs update-service \
+      --cluster "$CLUSTER" \
+      --service "$STREAMLIT_SERVICE" \
+      --force-new-deployment \
+      --desired-count "$STREAMLIT_COUNT" \
+      --region "$REGION" \
+      >/dev/null
+    echo "ECS service ${STREAMLIT_SERVICE} redeployment started (desired count=${STREAMLIT_COUNT})."
+  fi
 else
   echo "Stack ${STACK_NAME} not found. Deploy CloudFormation first, then re-run this script."
 fi
@@ -85,4 +105,13 @@ if [[ -n "$ALB_URL" && "$ALB_URL" != "None" ]]; then
   echo "API URL: ${ALB_URL}"
   echo "Health:  curl ${ALB_URL}/health"
   echo "Query:   curl -X POST ${ALB_URL}/query -H 'Content-Type: application/json' -d '{\"question\":\"How many rows?\"}'"
+fi
+
+STREAMLIT_URL="$(aws cloudformation describe-stacks \
+  --stack-name "$STACK_NAME" \
+  --region "$REGION" \
+  --query "Stacks[0].Outputs[?OutputKey=='StreamlitUrl'].OutputValue" \
+  --output text 2>/dev/null || true)"
+if [[ -n "$STREAMLIT_URL" && "$STREAMLIT_URL" != "None" ]]; then
+  echo "Streamlit: ${STREAMLIT_URL}"
 fi
