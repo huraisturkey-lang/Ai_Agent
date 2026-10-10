@@ -1,221 +1,332 @@
-Project: Data Architecture with Generative AI
+# Data Architecture with Generative AI (Text-to-SQL)
 
-Overview
-- A Text-to-SQL service that converts natural language questions into SQL queries using LangChain and AWS Bedrock (Amazon Nova models).
-- Multi-connector framework supporting Athena, Redshift, RDS (PostgreSQL/MySQL), Snowflake, and Databricks.
-- Notebook `mda_text_to_sql_langchain_bedrock.ipynb` demonstrates using LangChain + Bedrock to convert text to SQL and query data.
-- Datasets: `s3_library_data.json` (NDJSON), `s3_cars_data.csv` (CSV).
+Ask a question in plain English, get back an answer from your data. This service turns
+natural-language questions into SQL using **LangChain** + **AWS Bedrock** (Amazon Nova),
+runs the SQL safely (read-only), and returns the result. It ships as an HTTP API
+(FastAPI) and a chat UI (Streamlit), and runs on AWS ECS Fargate.
 
-Quick setup
-1. Create a Python virtualenv and install dependencies:
+Supported data sources: **Athena, Redshift, RDS (PostgreSQL/MySQL), Snowflake, Databricks.**
+
+---
+
+## New here? Read this first
+
+There are **two completely separate ways** this project gets deployed. People confuse
+them, so here is the plain-English version:
+
+| Path | What it does | Needs Docker on your laptop? |
+|------|--------------|------------------------------|
+| **A. Local script** — `./deploy-changeset.sh --auto` | Does *everything* from your machine: creates AWS infra, builds the Docker image **locally**, pushes it, starts ECS. | **Yes** |
+| **B. GitHub Actions** — `git push origin main` | GitHub's servers build the image and deploy. Triggered automatically on every push to `main`. | **No** |
+
+Important: these two do **not** call each other. The local script does *not* trigger the
+GitHub workflow. The GitHub workflow does *not* run the local script. Pick one path.
+
+The one thing they share: before Path B can deploy, the AWS **infrastructure must already
+exist** (ECR repo + ECS service), because the GitHub workflow only *builds and updates* —
+it does not create the base stack. So a common first-time flow is "create infra once, then
+let GitHub handle every deploy after that."
+
+---
+
+## Prerequisites
+
+Install these before you start:
+
+1. **Python 3.11** — check with `python3 --version`.
+2. **AWS account + AWS CLI** — run `aws configure` and set region `eu-north-1`.
+   Verify with `aws sts get-caller-identity`.
+3. **Amazon Bedrock access** — enable the Amazon Nova models in the Bedrock console
+   (region `eu-north-1`).
+4. **Docker Desktop** — *only if you use Path A (local build)*. Skip it for Path B.
+5. **(Optional) GitHub CLI `gh`** — handy for setting the deploy secret: `brew install gh`.
+
+---
+
+## Part 1 — Run it locally (no AWS deploy)
+
+Do this first to confirm everything works on your machine.
+
+### Step 1: Get the code and create a virtual environment
+```bash
+git clone https://github.com/huraisturkey-lang/Ai_Agent.git
+cd Ai_Agent
+python3 -m venv .venv
+source .venv/bin/activate
+```
+
+### Step 2: Install dependencies
+```bash
+pip install -r requirements-dev.txt   # prod deps + Streamlit + test tools
+```
+> `requirements.txt` = production deps (used by Docker). `requirements-dev.txt` includes
+> everything in it, plus `hypothesis` for testing. For local work, use the `-dev` one.
+
+### Step 3: Run the quality gate (no AWS calls)
+```bash
+make prod-check
+```
+This runs three things in order:
+- `make check` — compiles all Python (catches syntax errors)
+- `make test` — unit tests
+- `make smoke` — loads the sample data locally (`POC/run_smoke.py`)
+
+If all three pass, your environment is good.
+
+### Step 4: Launch the chat UI locally
+Set the required variables, then start Streamlit:
+```bash
+export APP_USERNAME=your-username          # login for the UI
+export APP_PASSWORD=your-password
+export GLUE_DB_NAME=project_library_db
+export GLUE_DB_NAMES=project_library_db,project_cars_db
+export PROJECT_FILES_BUCKET=langchain-<your-account-id>-eu-north-1
+export ATHENA_WORKGROUP=project-text-to-sql
+export ATHENA_USE_MANAGED_RESULTS=true
+make ui
+```
+Open **http://localhost:8501** and log in with the username/password you set.
+
+> Querying real data needs the AWS infrastructure from Part 2. The UI runs locally either
+> way, but answers come from AWS (Athena/Bedrock).
+
+Tip: copy `.env.template` to `.env` and fill it in instead of exporting variables each time:
+```bash
+cp .env.template .env   # then edit .env
+```
+
+---
+
+## Part 2 — Deploy to AWS
+
+### Choose your path
+
+- **Path A** if you have Docker and want one command to do everything.
+- **Path B** if you don't want Docker locally and prefer deploys to happen on `git push`.
+
+Both deploy into AWS account region `eu-north-1`.
+
+---
+
+### Path A — One command, builds locally (needs Docker)
+
+Make sure Docker Desktop is **running**, then:
+```bash
+./deploy-changeset.sh --auto
+```
+This single command, in order:
+1. Creates/updates the main CloudFormation stack (VPC, ECS, ALB, Glue, S3, Lambda).
+2. Builds the Docker image **on your machine** (`linux/amd64`) and pushes it to ECR.
+3. Scales up the ECS services (API + Streamlit).
+4. Runs the Glue crawlers (registers the data tables).
+5. Configures the S3 → Lambda notification.
+6. Sets up the GitHub Actions OIDC role + secret (so Path B works later).
+
+When it finishes it prints your **API URL** and **Streamlit URL**.
+
+Add the optional databases (Aurora + Redshift) at the same time, or later:
+```bash
+./deploy-changeset.sh --auto --with-databases
+```
+> Note the flag is `--with-databases` (not `--autodatabases`). Running the script a second
+> time is safe — the main stack updates in place, and the database stacks only deploy if
+> they don't already exist.
+
+---
+
+### Path B — Deploy on push, builds on GitHub (no Docker)
+
+This is a two-time setup, then it's automatic forever.
+
+**B1. Create the AWS infrastructure once (no Docker needed).**
+The GitHub workflow can only build+update; it can't create the base stack. Create it in
+review mode (this only makes a change set — no image build):
+```bash
+./deploy-changeset.sh                 # prints an "execute-change-set" command
+# run the execute command it printed, then:
+aws cloudformation wait stack-create-complete \
+  --stack-name cgs-ai-analyst-agent-project --region eu-north-1
+```
+After this, the ECR repo and ECS services exist (ECS starts at 0 tasks — no image yet,
+which is expected).
+
+**B2. Wire up GitHub → AWS auth (once).**
+The deploy workflow logs into AWS using an OIDC role and a repo secret.
+```bash
+./scripts/setup-github-oidc.sh
+```
+This creates the IAM role and (if `gh` is installed and logged in) sets the repo secret
+`AWS_DEPLOY_ROLE_ARN`. If `gh` isn't available, the script prints the role ARN — add it
+manually at **Repo → Settings → Secrets and variables → Actions → New repository secret**:
+- Name: `AWS_DEPLOY_ROLE_ARN`
+- Value: the printed `arn:aws:iam::<account>:role/github-actions-deploy-role`
+
+**B3. Deploy by pushing.**
+```bash
+git push origin main
+```
+On every push to `main`, GitHub Actions (`.github/workflows/deploy.yml`):
+runs the test gate → builds the image on GitHub's servers → pushes to ECR → redeploys ECS →
+prints the URLs. Watch it under the repo's **Actions** tab.
+
+> First time only: your Git login must have **write access** to the repo. If `git push`
+> returns `403 / permission denied`, you're authenticated as the wrong GitHub account —
+> push from a plain terminal with a Personal Access Token for an account that owns the repo.
+
+---
+
+## Part 3 — Optional databases
+
+The RDS Aurora and Redshift stacks are plain CloudFormation (no Docker). Deploy them
+directly whenever you want:
+```bash
+aws cloudformation deploy --template-file cloudformation-rds-aurora.yml \
+  --stack-name cgs-ai-rds-aurora --capabilities CAPABILITY_NAMED_IAM \
+  --region eu-north-1 --no-fail-on-empty-changeset
+
+aws cloudformation deploy --template-file cloudformation-redshift-serverless.yml \
+  --stack-name cgs-ai-redshift-serverless --capabilities CAPABILITY_NAMED_IAM \
+  --region eu-north-1 --no-fail-on-empty-changeset
+```
+Then load sample data into Aurora and point the connector at it:
+```bash
+PYTHONPATH=src python3 scripts/load_rds_data.py
+# paste the printed connection details into config/connections/rds-mysql.yaml
+```
+
+Each connector is driven by a YAML file in `config/connections/`. Copy the matching
+`*.yaml.template`, fill in the values, and the registry auto-discovers it on startup.
+Database passwords are stored in AWS Secrets Manager, not in the YAML (see `.env.template`
+for the expected secret names).
+
+---
+
+## Using the API
 
 ```bash
-python -m venv .venv
-source .venv/bin/activate
-pip install -r requirements-dev.txt   # includes Streamlit, hypothesis, and all prod deps
+# health check
+curl <API_URL>/health
+
+# ask a question
+curl -X POST <API_URL>/query \
+  -H 'Content-Type: application/json' \
+  -d '{"question": "How many books are there?"}'
 ```
 
-> **Note:** `requirements.txt` contains production dependencies including Streamlit (shipped in Docker).
-> `requirements-dev.txt` pulls in `requirements.txt` plus hypothesis for property-based testing.
-
-2. Configure AWS credentials (environment or AWS CLI).
-3. Set authentication credentials for the Streamlit UI:
-   ```bash
-   export APP_USERNAME=your-username
-   export APP_PASSWORD=your-password
-   ```
-4. Run `setup.sh` to perform optional staging actions (uploads are commented out).
-5. Run production checks:
-   - `make check` (syntax/compile gate)
-   - `make test` (unit tests)
-   - `make smoke` (local data smoke test)
-   - `make prod-check` (all of the above)
-
-Docker Desktop
-- **Not required** for: running the Streamlit UI (`make ui`), tests, scripts, querying the deployed API, or CloudFormation operations.
-- **Not required for CI/CD**: The `build-and-push-image` GitHub Actions workflow builds and pushes images remotely. Trigger with: `gh workflow run build-and-push-image`
-- **Required only** for local image builds (`./scripts/push_ecr.sh`, `make deploy-all`, `./deploy-changeset.sh --auto`).
-- Once the image is in ECR and ECS is running, Docker Desktop can be closed.
-
-Architecture
-
-```
-Internet -> ALB:80   -> FastAPI (ECS private subnet) -> Bedrock/Athena via VPC endpoints
-Internet -> ALB:8501 -> Streamlit (ECS private subnet) -> Bedrock/Athena via VPC endpoints
-                                                       -> RDS Aurora (private subnet, port 3306)
-                                                       -> Redshift Serverless (private subnet, port 5439)
+CLI version (for automation):
+```bash
+PYTHONPATH=src python scripts/run_query.py --question "How many books?" --json-output
 ```
 
-Files
-- `requirements.txt` — production dependencies (used by Docker, includes Streamlit)
-- `requirements-dev.txt` — dev/test extras (hypothesis) plus all of `requirements.txt`
-- `scripts/streamlit_app.py` — Streamlit chat UI (`make ui`)
-- `scripts/sidebar_helpers.py` — pure functions for connector UI (testable without Streamlit)
-- `scripts/serve.py` — FastAPI HTTP server (ECS entrypoint)
-- `scripts/run_query.py` — CLI query tool (supports `--json-output`)
-- `scripts/push_ecr.sh` — build + push Docker image + redeploy ECS services
-- `scripts/teardown.sh` — destroy all AWS resources
-- `scripts/setup-github-oidc.sh` — setup GitHub Actions CI/CD
-- `scripts/setup.sh` — dependency installation helper
-- `scripts/deploy-rds.sh` — deploy Aurora Serverless v2
-- `scripts/load_rds_data.py` — load sample data into Aurora
-- `scripts/configure_s3_notification.sh` — wire S3 event notifications to Lambda
-- `scripts/detect_existing_resources.sh` — detect pre-existing AWS resources for reuse
-- `scripts/get_vpc_params.sh` — query VPC parameters from CloudFormation
-- `cloudformation-template-validated.yml` — main IaC template (VPC, S3, Glue, ECS, Lambda)
-- `cloudformation-rds-aurora.yml` — Aurora Serverless v2 template
-- `cloudformation-redshift-serverless.yml` — Redshift Serverless template
-- `cloudformation-github-oidc.yml` — GitHub Actions OIDC role
-- `config/connections/*.yaml.template` — data source connection templates
-- `src/llm_sql/connectors/` — multi-connector framework (Athena, Redshift, RDS, Snowflake, Databricks)
-- `POC/` — staging/dev files (sample data, smoke test, notebooks, old scripts)
-- `.env.template` — environment variable template
-- `deploy-changeset.sh` — one-command deployment script
-- `DEPLOYMENT.md` — detailed deployment guide
+---
 
-S3 Buckets
-The CloudFormation template creates an S3 data bucket with a globally unique name:
-- `langchain-<account-id>-eu-north-1` — primary bucket (eu-north-1)
+## Tear down
 
-The bucket has versioning, AES-256 encryption, public access blocked, and a 30-day
-lifecycle rule to expire Athena query results.
+Remove all AWS resources when you're done:
+```bash
+make teardown
+```
 
-Deployment
-- See [DEPLOYMENT.md](DEPLOYMENT.md) for CloudFormation stack creation and change set workflow.
-- Deploy all: `./deploy-changeset.sh --auto`
-- Deploy with databases: `./deploy-changeset.sh --auto --with-databases`
-- Build image via GitHub (no Docker Desktop): `gh workflow run build-and-push-image`
-- Tear down: `make teardown`
-- CI/CD: Push to `main` triggers GitHub Actions (build + deploy)
+---
 
-CloudFormation Stacks
+## Troubleshooting
+
+- **`git push` → `403 denied to <account>`** — you're logged into GitHub as the wrong
+  account. Push from macOS Terminal.app with a Personal Access Token for an account that
+  owns the repo (editor terminals can inject a cached login).
+- **`fatal: 'origin' does not appear to be a git repository`** — the remote is missing.
+  Re-add it: `git remote add origin https://github.com/huraisturkey-lang/Ai_Agent.git`.
+- **GitHub deploy fails at "Configure AWS credentials"** — the `AWS_DEPLOY_ROLE_ARN` secret
+  is missing or the OIDC role doesn't exist. Do step **B2**.
+- **GitHub deploy fails on `ecs update-service` / ECR not found** — the base stack isn't
+  created yet. Do step **B1** first.
+- **Stack stuck in `REVIEW_IN_PROGRESS`** — a change set was created but never executed.
+  Delete the empty stack and recreate: `aws cloudformation delete-stack --stack-name
+  cgs-ai-analyst-agent-project --region eu-north-1`, then redo Path A or B1.
+- **`make smoke` import errors (`No module named boto3`)** — dependencies aren't installed
+  in the active environment. Activate the venv and `pip install -r requirements-dev.txt`.
+- **Docker build fails on Apple Silicon** — ECS needs `linux/amd64`. Use the provided
+  scripts (`./scripts/push_ecr.sh`) which cross-build automatically.
+
+---
+
+## How it fits together
+
+```
+Internet -> ALB:80   -> FastAPI  (ECS private subnet) -> Bedrock / Athena via VPC endpoints
+Internet -> ALB:8501 -> Streamlit (ECS private subnet) -> Bedrock / Athena via VPC endpoints
+                                                        -> RDS Aurora       (private subnet, 3306)
+                                                        -> Redshift Serverless (private subnet, 5439)
+```
+
+### CloudFormation stacks
 
 | Stack | Template | Purpose |
 |-------|----------|---------|
 | `cgs-ai-analyst-agent-project` | `cloudformation-template-validated.yml` | VPC, ECS, ALB, Lambda, Glue, S3, VPC endpoints |
 | `github-actions-oidc` | `cloudformation-github-oidc.yml` | GitHub Actions OIDC role for CI/CD |
-| `cgs-ai-rds-aurora` | `cloudformation-rds-aurora.yml` | Aurora Serverless v2 (MySQL), Secrets Manager credentials |
-| `cgs-ai-redshift-serverless` | `cloudformation-redshift-serverless.yml` | Redshift Serverless, Secrets Manager credentials |
+| `cgs-ai-rds-aurora` | `cloudformation-rds-aurora.yml` | Aurora Serverless v2 (MySQL) + Secrets Manager creds |
+| `cgs-ai-redshift-serverless` | `cloudformation-redshift-serverless.yml` | Redshift Serverless + Secrets Manager creds |
 
-CloudFormation Outputs (consumed by the notebook)
-| Output Key | Description |
-|---|---|
-| `VpcId` | Stack-managed VPC |
-| `PrivateSubnetIds` | Private subnets (ECS tasks, RDS, Redshift) |
-| `ServiceSecurityGroupId` | ECS security group (used by databases for ingress) |
-| `ProjectfilesBucketName` | Primary S3 bucket |
-| `LibraryDatabaseName` | Glue database for library data |
-| `CarsDatabaseName` | Glue database for cars data |
-| `LibraryCrawlerName` | Glue crawler for library data |
-| `CarsCrawlerName` | Glue crawler for cars data |
-| `AthenaWorkgroupName` | Athena workgroup for queries |
-| `LoadBalancerUrl` | Public HTTP URL for the Text-to-SQL API |
-| `StreamlitUrl` | Streamlit Chat UI URL |
-| `EcrRepositoryUri` | ECR URI for container images |
-| `EcsClusterName` | ECS cluster name |
-| `EcsServiceName` | ECS service name |
-| `CrawlerTriggerLambdaArn` | Lambda that auto-triggers Glue Crawlers |
+### GitHub Actions workflows
 
-Data & Testing
-- Run `python run_smoke.py` to smoke-test data loading and normalization locally (no AWS calls).
-- Normalized cars CSV: `s3_cars_data_normalized.csv` (produced by normalization).
-- Unit tests: `PYTHONPATH=src python -m unittest discover -s tests -p "test_*.py" -v`
+| Workflow | Trigger | What it does |
+|----------|---------|--------------|
+| `.github/workflows/ci.yml` | every push / PR | compile + unit tests + smoke (quality gate) |
+| `.github/workflows/deploy.yml` | push to `main` | tests → build image on GitHub → push to ECR → redeploy ECS |
+| `.github/workflows/build-image.yml` | manual (`workflow_dispatch`) | build + deploy, skips tests |
 
-Production baseline
-- Safer query execution defaults:
-  - read-only and allowlist SQL validation
-  - automatic `LIMIT` enforcement when missing
-  - max question length guard
-- Config hardening via typed settings:
-  - `MAX_RESULT_ROWS`, `MAX_QUESTION_CHARS`, `LOG_LEVEL`
-- Operational CLI behavior:
-  - explicit non-zero exit codes on setup/catalog/query failures
-  - optional JSON output (`--json-output`) for automation
-- Container hardening:
-  - non-root runtime user
-  - writable config directory for runtime connector management
-  - Python runtime safety defaults
-  - reduced Docker build context via `.dockerignore`
-- CI quality gate:
-  - compile checks, unit tests, and smoke test on push/PR
-- CI/CD pipelines:
-  - `deploy.yml` — full pipeline (tests + build + deploy) on push to main
-  - `build-image.yml` — manual-trigger build + deploy (skips tests, no Docker Desktop needed)
+### Key files
 
-Production readiness gaps (not yet implemented)
-- HTTPS/TLS (ALB is HTTP-only; need ACM certificate + HTTPS listener)
-- WAF (no AWS WAF in front of ALB)
-- Structured JSON logging (for CloudWatch Insights)
-- Request tracing (X-Ray or correlation IDs)
-- CloudWatch alarms (5xx rate, task health, Bedrock throttling)
-- Auto-scaling policies (currently fixed at 1 task)
-- Response caching (every question makes 3 LLM calls)
-- Rate limiting (no per-user throttle)
-- Query audit logging (no record of questions asked or SQL generated)
-- Multi-environment (no dev/staging separation)
-- Container vulnerability scanning (ECR scan not enabled)
+| Path | Purpose |
+|------|---------|
+| `src/llm_sql/` | application package (API, core text-to-SQL, config, connectors) |
+| `scripts/serve.py` | FastAPI server (ECS entrypoint) |
+| `scripts/streamlit_app.py` | Streamlit chat UI (`make ui`) |
+| `scripts/run_query.py` | CLI query tool (`--json-output`) |
+| `scripts/push_ecr.sh` | local build + push image + redeploy ECS |
+| `scripts/setup-github-oidc.sh` | set up GitHub Actions CI/CD auth |
+| `scripts/load_rds_data.py` | load sample data into Aurora |
+| `deploy-changeset.sh` | one-command local deploy (`--auto`, `--with-databases`) |
+| `config/connections/*.yaml` | one file per data source (copy from `*.template`) |
+| `POC/` | sample data, smoke test, notebooks |
+| `.env.template` | environment variable template |
+| `DEPLOYMENT.md` | detailed deployment guide |
 
-Production-grade setup
-1. Set required runtime variables:
-   - `GLUE_DB_NAME` (single database) or `GLUE_DB_NAMES` (comma-separated list for multi-database)
-   - `PROJECT_FILES_BUCKET`
-   - `APP_USERNAME` and `APP_PASSWORD` (required for Streamlit UI authentication)
-   - Optional hardening controls:
-     - `MAX_RESULT_ROWS` (default `200`)
-     - `MAX_QUESTION_CHARS` (default `1000`)
-     - `LOG_LEVEL` (`DEBUG|INFO|WARNING|ERROR|CRITICAL`)
-     - `ATHENA_WORKGROUP` (default `primary`; use `project-text-to-sql` when deployed via CloudFormation)
-     - `ATHENA_USE_MANAGED_RESULTS` (`true` if workgroup uses managed query results)
-     - `API_KEY` (optional HTTP API auth)
-   - Bedrock tuning:
-     - `BEDROCK_MODEL` (default `eu.amazon.nova-micro-v1:0`)
-     - `BEDROCK_MAX_RETRIES` (default `4`)
-     - `BEDROCK_RETRY_BASE_DELAY` (default `1.0` seconds)
-2. Run the full production gate locally before deployment:
-   - `make prod-check`
-3. Run the query CLI in automation-friendly mode when needed:
-   - `PYTHONPATH=src python scripts/run_query.py --question "..." --json-output`
-4. Build and run with Docker for consistent execution (ECS needs `linux/amd64`; use `scripts/push_ecr.sh` on Apple Silicon):
-   - `DESIRED_COUNT=1 ./scripts/push_ecr.sh`
-   - Local run: `docker build --platform linux/amd64 -t data-architecture-ai .`
-   - API: `GET /health`, `POST /query` with `{"question": "..."}`
-5. Deploy to ECS Fargate (recommended production path):
-   - `./deploy-changeset.sh --auto` (deploys stack + builds image + starts service)
-   - Or step by step: `./deploy-changeset.sh` → execute change set → `DESIRED_COUNT=1 ./scripts/push_ecr.sh`
-   - See [DEPLOYMENT.md](DEPLOYMENT.md) for full ECS workflow
-6. Deploy Aurora Serverless v2 (optional, for RDS MySQL connector):
-   - `./scripts/deploy-rds.sh --auto`
-   - Paste the printed connection config into `config/connections/rds-mysql.yaml`
-   - Load sample data: `PYTHONPATH=src python3 scripts/load_rds_data.py`
-7. Keep CI required on pull requests:
-   - Workflow: `.github/workflows/ci.yml`
-   - Gates: compile, unit tests, smoke test
+---
 
-Notebook environment variable
-Set `CFN_STACK_NAME` before launching Jupyter to avoid editing the placeholder in cell 4:
-```bash
-export CFN_STACK_NAME=cgs-ai-analyst-agent-project
-```
+## Configuration reference
 
-Streamlit UI
+Set these as environment variables or in `.env` (copy from `.env.template`):
 
-Streamlit is included in `requirements.txt` (production deps). Use `make ui` (which installs dev deps into `.venv` automatically) or install manually first:
+| Variable | Required | Default | Notes |
+|----------|----------|---------|-------|
+| `APP_USERNAME` / `APP_PASSWORD` | Yes (UI) | — | Streamlit login; UI blocks without them |
+| `GLUE_DB_NAME` / `GLUE_DB_NAMES` | Yes | `project_library_db` | single, or comma-separated list |
+| `PROJECT_FILES_BUCKET` | Yes | — | `langchain-<account-id>-eu-north-1` |
+| `ATHENA_WORKGROUP` | — | `primary` | use `project-text-to-sql` when deployed |
+| `ATHENA_USE_MANAGED_RESULTS` | — | — | `true` if workgroup uses managed results |
+| `AWS_REGION` | — | `eu-north-1` | |
+| `BEDROCK_MODEL` | — | `eu.amazon.nova-micro-v1:0` | |
+| `BEDROCK_MAX_RETRIES` | — | `4` | |
+| `BEDROCK_RETRY_BASE_DELAY` | — | `1.0` | seconds |
+| `MAX_RESULT_ROWS` | — | `200` | automatic `LIMIT` cap |
+| `MAX_QUESTION_CHARS` | — | `1000` | question length guard |
+| `PORT` | — | `8080` | HTTP API port |
+| `API_KEY` | — | — | optional HTTP API auth |
+| `LOG_LEVEL` | — | `INFO` | `DEBUG`/`INFO`/`WARNING`/`ERROR`/`CRITICAL` |
+| `API_URL` | — | — | route Streamlit through the deployed API |
+| `SECRETS_MANAGER_SECRET` | — | — | optional Secrets Manager integration |
 
-```bash
-export GLUE_DB_NAME=project_library_db
-export GLUE_DB_NAMES=project_library_db,project_cars_db
-export PROJECT_FILES_BUCKET=langchain-<account-id>-eu-north-1
-export ATHENA_WORKGROUP=project-text-to-sql
-export ATHENA_USE_MANAGED_RESULTS=true
-export APP_USERNAME=your-username
-export APP_PASSWORD=your-password
-make ui
-```
+Safety defaults built in: read-only + allowlist SQL validation, automatic `LIMIT`
+enforcement, max question length, non-root container user.
 
-Opens http://localhost:8501 — or set `API_URL` to use the deployed ECS API. See [DEPLOYMENT.md](DEPLOYMENT.md).
+---
 
-Authentication: The Streamlit UI requires `APP_USERNAME` and `APP_PASSWORD` environment variables. Without these, the login screen shows an error and blocks access.
+## Not yet implemented (production hardening gaps)
 
-Next steps
-- Review `mda_text_to_sql_langchain_bedrock.ipynb` and set `CFN_STACK_NAME`.
-- Run `deploy-changeset.sh` to create a change set and review before deploying to AWS.
+HTTPS/TLS (ALB is HTTP-only), AWS WAF, structured JSON logging, request tracing,
+CloudWatch alarms, auto-scaling (fixed at 1 task), response caching, rate limiting,
+query audit logging, dev/staging separation, ECR vulnerability scanning.
+
+See [DEPLOYMENT.md](DEPLOYMENT.md) for the detailed deployment reference.
