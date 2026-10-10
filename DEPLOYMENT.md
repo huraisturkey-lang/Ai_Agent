@@ -370,7 +370,7 @@ Redeploy ECS (`./scripts/push_ecr.sh`) or restart local Streamlit. The app auto-
 
 ### Athena AccessDenied: ListTableMetadata
 
-LangChain's SQL layer calls `athena:ListTableMetadata` when connecting. The ECS task role must include metadata permissions (added in the template).
+The PyAthena/SQLAlchemy driver can call `athena:ListTableMetadata` when connecting. The ECS task role must include metadata permissions (added in the template).
 
 Update the stack, then restart ECS tasks:
 
@@ -399,6 +399,30 @@ Or attach the missing actions to role `cgs-ai-analyst-agent-project-EcsTaskRole-
 
 ### Stack creation timeout
 - If the stack creation takes too long, check CloudFormation events for errors: `aws cloudformation describe-stack-events --stack-name "$STACK_NAME" --region "$AWS_REGION"`
+
+### Streamlit UI credentials (stack-managed)
+
+The CloudFormation stack creates and owns the `cgs-ai-analyst-agent/streamlit-credentials`
+Secrets Manager secret — you do not create it manually before deploying. At create time,
+`APP_USERNAME` is seeded from the `StreamlitUsername` parameter (default `admin`) and
+`APP_PASSWORD` is auto-generated (24 characters). The generated password is set only on
+create; CloudFormation does not overwrite it on later stack updates. Retrieve the login with:
+
+```bash
+aws secretsmanager get-secret-value \
+  --secret-id "cgs-ai-analyst-agent/streamlit-credentials" \
+  --query SecretString --output text --region eu-north-1
+```
+
+To set your own password, rotate it out-of-band with `aws secretsmanager put-secret-value`
+(see below) and force a new Streamlit deployment.
+
+**Fail-safe reconciliation:** `deploy-changeset.sh` auto-heals a common edge case. If a
+secret named `cgs-ai-analyst-agent/streamlit-credentials` already exists but is *not* owned
+by the stack (e.g. created by hand during troubleshooting), the script removes that orphan
+before creating the change set so CloudFormation can create and own it — a secret already
+managed by the stack is never touched. This makes repeated deploys idempotent regardless of
+starting state.
 
 ### Streamlit 503: secret marked for deletion
 

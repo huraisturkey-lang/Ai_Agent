@@ -32,6 +32,53 @@ done
 # Detect which data-layer resources already exist
 eval "$(bash scripts/detect_existing_resources.sh | grep -E '^[A-Z_]+=')"
 
+# ── Reconcile Streamlit credentials secret (fail-safe, idempotent) ──────────
+# The stack owns `cgs-ai-analyst-agent/streamlit-credentials` as a managed
+# AWS::SecretsManager::Secret. If an UNMANAGED secret with that name already
+# exists (e.g. created by hand during troubleshooting), CloudFormation would
+# fail with "already exists". Here we detect that case and remove the orphan so
+# the stack can create and own it cleanly. A secret already owned by THIS stack
+# is left untouched — we never delete a stack-managed secret.
+reconcile_streamlit_secret() {
+  local secret_name="cgs-ai-analyst-agent/streamlit-credentials"
+  local desc
+  desc="$(aws secretsmanager describe-secret \
+    --secret-id "$secret_name" \
+    --region "$REGION" \
+    --query '{Tags:Tags,ARN:ARN}' \
+    --output json 2>/dev/null || echo '')"
+  # Not found → nothing to reconcile; the template will create it.
+  if [[ -z "$desc" || "$desc" == "None" ]]; then
+    return 0
+  fi
+  # Is it already managed by this CloudFormation stack? CFN tags managed
+  # resources with aws:cloudformation:stack-name.
+  local owner
+  owner="$(printf '%s' "$desc" \
+    | python3 -c "import sys,json; d=json.load(sys.stdin); print(next((t['Value'] for t in (d.get('Tags') or []) if t['Key']=='aws:cloudformation:stack-name'), ''))" 2>/dev/null || echo '')"
+  if [[ "$owner" == "$STACK_NAME" ]]; then
+    echo "✓ Streamlit secret already managed by stack ${STACK_NAME} — leaving as-is."
+    return 0
+  fi
+  echo "⚠️  Found an unmanaged secret '${secret_name}' (owner='${owner:-none}')."
+  echo "    Removing it so CloudFormation can create and own it..."
+  aws secretsmanager delete-secret \
+    --secret-id "$secret_name" \
+    --force-delete-without-recovery \
+    --region "$REGION" >/dev/null 2>&1 || true
+  # Wait until the name is actually free (force-delete is near-immediate, but
+  # poll briefly so the subsequent change set never races the deletion).
+  for _ in $(seq 1 10); do
+    if ! aws secretsmanager describe-secret --secret-id "$secret_name" --region "$REGION" >/dev/null 2>&1; then
+      echo "✓ Orphan secret removed — name is free for the stack."
+      return 0
+    fi
+    sleep 2
+  done
+  echo "⚠️  Secret '${secret_name}' still resolving after delete — the stack may retry."
+}
+reconcile_streamlit_secret
+
 # ── Change set type ────────────────────────────────────────────────────────
 CHANGE_SET_NAME="${STACK_NAME}-changeset-$(date +%s)"
 
