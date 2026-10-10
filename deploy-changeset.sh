@@ -4,8 +4,9 @@
 # VPC parameters are needed. No NAT gateway is used.
 #
 # Usage:
-#   ./deploy-changeset.sh          # Review mode: creates change set, shows summary
-#   ./deploy-changeset.sh --auto   # Full auto: deploy stack + push image + start service
+#   ./deploy-changeset.sh                    # Review mode: creates change set, shows summary
+#   ./deploy-changeset.sh --auto             # Full auto: deploy stack + push image + start service
+#   ./deploy-changeset.sh --auto --with-databases  # Also deploy RDS Aurora + Redshift Serverless
 set -euo pipefail
 
 # ── Configuration ─────────────────────────────────────────────────────────
@@ -18,11 +19,13 @@ STREAMLIT_DESIRED_COUNT="${STREAMLIT_DESIRED_COUNT:-1}"
 STREAMLIT_USERNAME="${STREAMLIT_USERNAME:-}"
 STREAMLIT_PASSWORD="${STREAMLIT_PASSWORD:-}"
 AUTO_MODE=false
+WITH_DATABASES=false
 
 # Parse flags
 for arg in "$@"; do
   case "$arg" in
     --auto) AUTO_MODE=true ;;
+    --with-databases) WITH_DATABASES=true ;;
   esac
 done
 
@@ -248,6 +251,122 @@ if $AUTO_MODE; then
   echo "Configuring S3 event notification (fail-safe)..."
   echo "=========================================="
   bash scripts/configure_s3_notification.sh || echo "⚠️  S3 notification config skipped (Lambda may not be ready yet)"
+
+  # ── Deploy database stacks (optional) ────────────────────────────────────
+  if $WITH_DATABASES; then
+    echo ""
+    echo "=========================================="
+    echo "Deploying RDS Aurora Serverless v2..."
+    echo "=========================================="
+    RDS_STACK="cgs-ai-rds-aurora"
+    RDS_STATUS="$(aws cloudformation describe-stacks \
+      --stack-name "$RDS_STACK" \
+      --region "$REGION" \
+      --query 'Stacks[0].StackStatus' \
+      --output text 2>/dev/null || echo 'NOT_FOUND')"
+
+    if [[ "$RDS_STATUS" == "NOT_FOUND" || "$RDS_STATUS" == "DELETE_COMPLETE" ]]; then
+      aws cloudformation deploy \
+        --template-file cloudformation-rds-aurora.yml \
+        --stack-name "$RDS_STACK" \
+        --capabilities CAPABILITY_NAMED_IAM \
+        --region "$REGION" \
+        --no-fail-on-empty-changeset \
+        --tags "Key=Environment,Value=production" || echo "⚠️  RDS stack deploy failed"
+      echo "✓ RDS Aurora stack deployed"
+    else
+      echo "✓ RDS stack already exists ($RDS_STATUS)"
+    fi
+
+    echo ""
+    echo "=========================================="
+    echo "Deploying Redshift Serverless..."
+    echo "=========================================="
+    REDSHIFT_STACK="cgs-ai-redshift-serverless"
+    REDSHIFT_STATUS="$(aws cloudformation describe-stacks \
+      --stack-name "$REDSHIFT_STACK" \
+      --region "$REGION" \
+      --query 'Stacks[0].StackStatus' \
+      --output text 2>/dev/null || echo 'NOT_FOUND')"
+
+    if [[ "$REDSHIFT_STATUS" == "NOT_FOUND" || "$REDSHIFT_STATUS" == "DELETE_COMPLETE" ]]; then
+      aws cloudformation deploy \
+        --template-file cloudformation-redshift-serverless.yml \
+        --stack-name "$REDSHIFT_STACK" \
+        --capabilities CAPABILITY_NAMED_IAM \
+        --region "$REGION" \
+        --no-fail-on-empty-changeset \
+        --tags "Key=Environment,Value=production" || echo "⚠️  Redshift stack deploy failed"
+      echo "✓ Redshift Serverless stack deployed"
+    else
+      echo "✓ Redshift stack already exists ($REDSHIFT_STATUS)"
+    fi
+
+    # Print connection info
+    echo ""
+    echo "Database connection configs:"
+    RDS_ENDPOINT="$(aws cloudformation describe-stacks \
+      --stack-name "$RDS_STACK" --region "$REGION" \
+      --query "Stacks[0].Outputs[?OutputKey=='ClusterEndpoint'].OutputValue" \
+      --output text 2>/dev/null || echo 'pending')"
+    REDSHIFT_ENDPOINT="$(aws cloudformation describe-stacks \
+      --stack-name "$REDSHIFT_STACK" --region "$REGION" \
+      --query "Stacks[0].Outputs[?OutputKey=='RedshiftWorkgroupEndpoint'].OutputValue" \
+      --output text 2>/dev/null || echo 'pending')"
+    echo "  RDS Aurora:   $RDS_ENDPOINT"
+    echo "  Redshift:     $REDSHIFT_ENDPOINT"
+  fi
+
+  echo ""
+  echo "=========================================="
+  echo "Setting up GitHub Actions OIDC (CI/CD)..."
+  echo "=========================================="
+  OIDC_STACK="github-actions-oidc"
+  OIDC_STATUS="$(aws cloudformation describe-stacks \
+    --stack-name "$OIDC_STACK" \
+    --region "$REGION" \
+    --query 'Stacks[0].StackStatus' \
+    --output text 2>/dev/null || echo 'NOT_FOUND')"
+
+  if [[ "$OIDC_STATUS" == "NOT_FOUND" || "$OIDC_STATUS" == "DELETE_COMPLETE" ]]; then
+    # Check if OIDC provider already exists in account
+    EXISTING_OIDC="$(aws iam list-open-id-connect-providers \
+      --query "OpenIDConnectProviderList[?ends_with(Arn, '/token.actions.githubusercontent.com')].Arn" \
+      --output text 2>/dev/null || echo '')"
+
+    DEPLOY_OIDC_ARGS=(
+      --template-file cloudformation-github-oidc.yml
+      --stack-name "$OIDC_STACK"
+      --capabilities CAPABILITY_NAMED_IAM
+      --region "$REGION"
+      --no-fail-on-empty-changeset
+    )
+
+    if [[ -n "$EXISTING_OIDC" && "$EXISTING_OIDC" != "None" ]]; then
+      DEPLOY_OIDC_ARGS+=(--parameter-overrides "OIDCProviderArn=$EXISTING_OIDC")
+    fi
+
+    aws cloudformation deploy "${DEPLOY_OIDC_ARGS[@]}" 2>/dev/null || echo "⚠️  OIDC stack deploy failed (non-blocking)"
+
+    ROLE_ARN="$(aws cloudformation describe-stacks \
+      --stack-name "$OIDC_STACK" \
+      --region "$REGION" \
+      --query "Stacks[0].Outputs[?OutputKey=='DeployRoleArn'].OutputValue" \
+      --output text 2>/dev/null || echo '')"
+
+    if [[ -n "$ROLE_ARN" && "$ROLE_ARN" != "None" ]]; then
+      echo "✓ GitHub OIDC role: $ROLE_ARN"
+      if command -v gh &>/dev/null; then
+        gh secret set AWS_DEPLOY_ROLE_ARN --body "$ROLE_ARN" 2>/dev/null && \
+          echo "✓ GitHub secret AWS_DEPLOY_ROLE_ARN set" || \
+          echo "⚠️  Could not set GitHub secret (run: gh secret set AWS_DEPLOY_ROLE_ARN --body \"$ROLE_ARN\")"
+      else
+        echo "  Set GitHub secret manually: gh secret set AWS_DEPLOY_ROLE_ARN --body \"$ROLE_ARN\""
+      fi
+    fi
+  else
+    echo "✓ OIDC stack already exists ($OIDC_STATUS)"
+  fi
 
   echo ""
   echo "=========================================="

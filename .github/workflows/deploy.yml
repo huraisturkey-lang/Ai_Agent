@@ -31,11 +31,11 @@ jobs:
         with:
           python-version: "3.11"
       - run: pip install -r requirements.txt
-      - run: python -m compileall src scripts lambda run_smoke.py
+      - run: python -m compileall src scripts lambda POC/run_smoke.py
       - run: python -m unittest discover -s tests -p "test_*.py" -v
         env:
           PYTHONPATH: src
-      - run: python run_smoke.py
+      - run: python POC/run_smoke.py
 
   # ── Build + Push + Deploy ──────────────────────────────────────────────────
   deploy:
@@ -78,21 +78,33 @@ jobs:
             --force-new-deployment \
             --desired-count $DESIRED_COUNT \
             --region $AWS_REGION
+          aws ecs update-service \
+            --cluster $ECS_CLUSTER \
+            --service data-architecture-ai-streamlit \
+            --force-new-deployment \
+            --desired-count 1 \
+            --region $AWS_REGION
 
       - name: Wait for service stability
         run: |
-          echo "Waiting for ECS service to stabilize..."
+          echo "Waiting for ECS services to stabilize..."
           aws ecs wait services-stable \
             --cluster $ECS_CLUSTER \
-            --services $ECS_SERVICE \
-            --region $AWS_REGION || echo "Timeout waiting for stability (service may still be deploying)"
+            --services $ECS_SERVICE data-architecture-ai-streamlit \
+            --region $AWS_REGION || echo "Timeout waiting for stability (services may still be deploying)"
 
-      - name: Print API URL
+      - name: Print URLs
         run: |
           ALB_URL=$(aws cloudformation describe-stacks \
             --stack-name $STACK_NAME \
             --region $AWS_REGION \
             --query "Stacks[0].Outputs[?OutputKey=='LoadBalancerUrl'].OutputValue" \
             --output text)
+          STREAMLIT_URL=$(aws cloudformation describe-stacks \
+            --stack-name $STACK_NAME \
+            --region $AWS_REGION \
+            --query "Stacks[0].Outputs[?OutputKey=='StreamlitUrl'].OutputValue" \
+            --output text)
           echo "🚀 API deployed: $ALB_URL"
+          echo "🖥️  Streamlit: $STREAMLIT_URL"
           echo "Health check: $ALB_URL/health"
